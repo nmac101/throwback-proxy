@@ -219,25 +219,155 @@ def _strip_at_blocks(css, names):
         css = css[: m.start()] + " " + css[j + 1 :]
 
 
-def _replace_gradients(css):
-    for name in (
-        "linear-gradient",
-        "radial-gradient",
-        "-webkit-linear-gradient",
-        "-moz-linear-gradient",
-    ):
-        while True:
-            i = css.lower().find(name + "(")
-            if i < 0:
-                break
-            j = _balanced_paren(css, i + len(name))
-            inner = css[i + len(name) + 1 : j]
-            cm = re.search(
-                r"(#[0-9a-fA-F]{3,8}\b|rgba?\([^)]*\)|hsla?\([^)]*\))", inner
-            )
-            color = cm.group(1) if cm else "#ffffff"
-            css = css[:i] + color + css[j + 1 :]
-    return css
+_NAMED_COLORS = {
+    "black": "#000000", "white": "#ffffff", "red": "#ff0000",
+    "green": "#008000", "lime": "#00ff00", "blue": "#0000ff",
+    "yellow": "#ffff00", "orange": "#ffa500", "purple": "#800080",
+    "gray": "#808080", "grey": "#808080", "silver": "#c0c0c0",
+    "maroon": "#800000", "navy": "#000080", "teal": "#008080",
+    "olive": "#808000", "aqua": "#00ffff", "cyan": "#00ffff",
+    "magenta": "#ff00ff", "fuchsia": "#ff00ff",
+}
+
+
+def _to_hex(color):
+    c = color.strip().lower()
+    if c in _NAMED_COLORS:
+        return _NAMED_COLORS[c]
+    m = re.match(r"rgb\((\d+),\s*(\d+),\s*(\d+)\)$", c)
+    if m:
+        return "#%02x%02x%02x" % tuple(int(x) for x in m.groups())
+    if re.fullmatch(r"#[0-9a-f]{6}", c):
+        return c
+    if re.fullmatch(r"#[0-9a-f]{3}", c):
+        return "#" + "".join(ch * 2 for ch in c[1:])
+    return None
+
+
+def _px(value):
+    m = re.match(r"\s*(-?[\d.]+)px", value)
+    return float(m.group(1)) if m else 0.0
+
+
+_COLOR_RE = r"(#[0-9a-fA-F]{3,8}\b|rgb\([^)]*\)|%s\b)" % "|".join(_NAMED_COLORS)
+
+
+def _gradient_filter(value):
+    """IE6 DX gradient filter approximating a CSS gradient.
+
+    Returns (filter_value, first_color) or None. Only the two end colors and
+    the nearest of the four cardinal directions can be represented.
+    """
+    m = re.search(r"(?:linear|radial)-gradient\(", value)
+    if not m:
+        return None
+    i = value.index("(", m.start())
+    j = _balanced_paren(value, i)
+    inner = value[i + 1 : j]
+    colors = re.findall(_COLOR_RE, inner)
+    if not colors:
+        return None
+    first, last = colors[0], colors[-1]
+    am = re.match(r"\s*(?:to\s+(right|left|top|bottom)|(-?[\d.]+)deg?)", inner)
+    angle = 270.0  # CSS default direction is "to top"
+    if am:
+        if am.group(1):
+            angle = {"right": 0, "left": 180, "top": 270, "bottom": 90}[am.group(1)]
+        else:
+            angle = float(am.group(2)) % 360
+    angle = min((0, 90, 180, 270), key=lambda a: abs(a - angle))
+    gtype = 0 if angle in (0, 180) else 1  # 0: left->right, 1: top->bottom
+    start, end = (first, last) if angle in (0, 90) else (last, first)
+    filt = (
+        "progid:DXImageTransform.Microsoft.Gradient(GradientType=%d,"
+        " StartColorStr='%s', EndColorStr='%s')" % (gtype, _to_hex(start), _to_hex(end))
+    )
+    return filt, first
+
+
+def _shadow_filter(value):
+    """IE6 DropShadow filter from the first box-shadow/text-shadow."""
+    if "inset" in value.lower():
+        return None
+    lengths = re.findall(r"-?[\d.]+(?:px|em)", value)
+    color_m = re.search(_COLOR_RE, value)
+    if len(lengths) < 2 or not color_m:
+        return None
+    hexc = _to_hex(color_m.group(1))
+    if not hexc:
+        return None
+    return (
+        "progid:DXImageTransform.Microsoft.DropShadow("
+        "OffX=%g,OffY=%g,Color='%s')" % (_px(lengths[0]), _px(lengths[1]), hexc)
+    )
+
+
+def _transform_decls(body):
+    """Down-grade one declaration block to IE6.
+
+    Modern effects are approximated with DXImageTransform filters and CSS
+    expressions (both IE6/7-only features); the rest is dropped.
+    """
+    filters = []
+    decls = []
+    fixed = False
+    jc = re.search(r"justify-content\s*:\s*([^;]+)", body, re.I)
+    center = bool(jc and "center" in jc.group(1))
+    for d in body.split(";"):
+        if ":" not in d:
+            continue
+        prop, _, val = d.partition(":")
+        p = prop.strip().lower()
+        v = val.strip()
+        if p == "opacity":
+            try:
+                filters.append("alpha(opacity=%d)" % round(float(v) * 100))
+            except ValueError:
+                pass
+            continue
+        if p in ("box-shadow", "text-shadow"):
+            f = _shadow_filter(v)
+            if f:
+                filters.append(f)
+            continue
+        g = _gradient_filter(v)
+        if g:
+            filters.append(g[0])
+            if p == "background":  # keep a solid fallback color
+                decls.append("background-color: %s" % g[1])
+            continue
+        if p in ("filter", "-ms-filter"):
+            if "progid:" in v.lower():  # already an IE filter -- keep it
+                decls.append("%s: %s" % (prop.strip(), v))
+            continue
+        if BAD_PROP_RE.match(p):
+            continue
+        if p == "display" and re.search(r"(inline-)?(flex|grid)", v):
+            v = "inline" if "inline" in v else "block"
+            if center and v == "block":
+                decls.append("text-align: center")
+        elif p == "position" and v.lower().startswith("fixed"):
+            v = "absolute"
+            fixed = True
+        decls.append("%s: %s" % (prop.strip(), v))
+    if fixed:
+        # CSS expressions are the classic IE6 "position: fixed" hack.
+        tm = re.search(r"(?<![\w-])top\s*:\s*([^;]+)", body, re.I)
+        lm = re.search(r"(?<![\w-])left\s*:\s*([^;]+)", body, re.I)
+        top_off = _px(tm.group(1)) if tm else 0.0
+        left_off = _px(lm.group(1)) if lm else 0.0
+        decls.append("position: absolute")
+        decls.append(
+            "left: expression((document.documentElement.scrollLeft"
+            "||document.body.scrollLeft)+%g)" % left_off
+        )
+        decls.append(
+            "top: expression((document.documentElement.scrollTop"
+            "||document.body.scrollTop)+%g)" % top_off
+        )
+    if filters:
+        decls.append("filter: %s" % ", ".join(filters))
+    return "; ".join(decls)
 
 
 def _eval_calc(inner):
@@ -272,21 +402,10 @@ def _filter_rules(css):
         sel = sel.replace("::", ":")  # IE6 uses single-colon pseudos
         if BAD_SELECTOR_RE.search(sel):
             return ""
-        decls = []
-        for d in body.split(";"):
-            if ":" not in d:
-                continue
-            prop, _, val = d.partition(":")
-            p = prop.strip().lower()
-            if BAD_PROP_RE.match(p):
-                continue
-            v = val.strip()
-            if p == "display" and re.search(r"(inline-)?(flex|grid)", v):
-                v = "inline" if "inline" in v else "block"
-            elif p == "position" and v.lower().startswith("fixed"):
-                v = "absolute"
-            decls.append("%s: %s" % (prop.strip(), v))
-        return "%s { %s }" % (sel, "; ".join(decls))
+        decls = _transform_decls(body)
+        if not decls:
+            return ""
+        return "%s { %s }" % (sel, decls)
 
     return re.sub(r"([^{}]+)\{([^{}]*)\}", sub, css)
 
@@ -297,7 +416,6 @@ def transform_css(css, base):
         css, ["font-face", "keyframes", "-webkit-keyframes", "-moz-keyframes"]
     )
     css = _strip_at_blocks(css, ["media", "supports"])
-    css = _replace_gradients(css)
     css = re.sub(
         r"rgba\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)[^)]*\)", r"rgb(\1,\2,\3)", css, re.I
     )
@@ -367,7 +485,7 @@ def _rewrite_attrs(tag, base):
         if name == "srcset":
             return ""
         if name == "style":
-            return 'style="%s"' % _rewrite_css_urls(val, base).replace(
+            return 'style="%s"' % _rewrite_css_urls(_transform_decls(val), base).replace(
                 '"', "'"
             )
         if name in ("src", "href", "poster") and val:
@@ -413,10 +531,23 @@ def transform_html(html, base):
     html = re.sub(r"</picture\s*>", "</div>", html, flags=re.I)
     html = re.sub(r"<source\b[^>]*>", "", html, flags=re.I)
 
-    # Media elements IE6 cannot show.
+    # Media elements IE6 cannot show: sized placeholders where possible.
+    def _media_ph(m):
+        tag, attrs = m.group(1), (m.group(2) or "")
+        if tag.lower() == "audio":
+            return "<span></span>"
+        w = re.search(r'width\s*=\s*["\']?(\d+)', attrs, re.I)
+        h = re.search(r'height\s*=\s*["\']?(\d+)', attrs, re.I)
+        if w and h:
+            return (
+                "<span style='display:block;width:%spx;height:%spx;"
+                "background-color:#dddddd;border:1px solid #999999'></span>"
+            ) % (w.group(1), h.group(1))
+        return "<span></span>"
+
     html = re.sub(
         r"<(video|audio|canvas)(\s[^>]*)?>.*?</\1\s*>",
-        "<span></span>",
+        _media_ph,
         html,
         flags=re.I | re.S,
     )

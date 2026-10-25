@@ -42,7 +42,7 @@ Without `openssl`, `http://` sites still work but `https://` ones fail.
 
 ### HTML (text/html)
 - Down-converts HTML5 elements, keeping structure: `section/article/nav/header/footer/main/aside/figure` → `div`, `time/bdi/mark/...` → `span`, `<wbr>` removed.
-- `<canvas>`, `<video>`, `<audio>` replaced with empty inline placeholders.
+- `<canvas>`, `<video>`, `<audio>` replaced with placeholders; `<video>`/`<canvas>` with `width`+`height` become a sized grey box so the layout doesn't collapse.
 - `<picture>` kept as a div with its fallback `<img>`; `<source>` (srcset) dropped.
 - `<script type="module">` and Google ad scripts removed; `defer`/`async` stripped from remaining scripts.
 - Doctype swapped for XHTML 1.0 Strict (IE6 standards mode); a UTF-8 charset meta is injected if missing.
@@ -50,11 +50,16 @@ Without `openssl`, `http://` sites still work but `https://` ones fail.
 
 ### CSS (text/css and inline styles)
 - `@media`, `@supports`, `@font-face`, `@keyframes` blocks removed.
-- `display: flex/grid` → `block`/`inline`; all flexbox/grid properties dropped.
-- `position: fixed` → `absolute`.
-- Gradients collapsed to their first color; `rgba()`/`hsl()` → `rgb()`.
+- `display: flex/grid` → `block`/`inline`; flexbox/grid properties dropped. A flex container with `justify-content: center` also gets `text-align: center` so inline content stays centered.
+- `position: fixed` → the classic IE6 CSS-expression hack (`absolute` + `scrollLeft`/`scrollTop` expressions), preserving the element's top/left offset. (Offsets given via `bottom`/`right` are not preserved.)
+- **Modern effects are approximated with IE6's DXImageTransform filters** rather than just dropped:
+  - `linear-gradient()` / `radial-gradient()` → `DXImageTransform.Microsoft.Gradient` (end colors + nearest cardinal direction), with the first stop kept as a solid `background-color` fallback.
+  - `box-shadow` / `text-shadow` → `DXImageTransform.Microsoft.DropShadow` (first shadow only; `inset` dropped).
+  - `opacity: 0–1` → `alpha(opacity=0–100)`.
+  - Existing IE `progid:` filters are passed through untouched.
+- `rgba()`/`hsl()` → `rgb()`.
 - `calc()` evaluated when possible; `vw`/`vh` approximated as px (assuming a 1024×768 screen).
-- Unsupported properties (`border-radius`, `box-shadow`, `transform`, `transition`, `animation`, `filter`, ...) and selectors (`:not()`, `:nth-*`, `:is()`, `:where()`, `:has()`, ...) removed.
+- Unsupported properties (`border-radius`, `transform`, `transition`, `animation`, ...) and selectors (`:not()`, `:nth-*`, `:is()`, `:where()`, `:has()`, ...) removed.
 - `::pseudo` → `:pseudo`; all `url()` references rewritten through the proxy.
 
 ### Images
@@ -68,5 +73,6 @@ Requests whose host matches a known ad/tracking domain (doubleclick, googlesyndi
 
 ## Caveats
 - Rewriting is regex-based (no full parser): it handles the vast majority of real-world markup but exotic/nested constructs may slip through.
+- Gradient/shadow approximations are lossy: only the two end colors and the nearest of four directions survive; multiple shadows collapse to the first. `border-radius`, `transform`, transitions and animations have no IE6 equivalent and are dropped.
 - JavaScript that *runs* is left as-is; modern ES2015+ scripts will simply fail silently in IE6, which is why module scripts are dropped up front.
 - POST requests and uploads are not proxied (IE6-era browsing was mostly GET).
