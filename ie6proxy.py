@@ -75,7 +75,7 @@ except ImportError:  # pragma: no cover
         pass
 
 
-HOST = "127.0.0.1"
+HOST = "0.0.0.0"
 DEFAULT_PORT = 8080
 UPSTREAM_UA = (
     "Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 "
@@ -509,13 +509,24 @@ class Handler(BaseHTTPRequestHandler):
         sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
 
     def _is_foreign_host(self):
-        """True when the Host header points at a site other than this proxy."""
+        """True when the Host header points at a site other than this proxy.
+
+        We are bound to 0.0.0.0, so direct browsing may arrive with any of
+        our IPs in the Host header; treat anything on our port (or loopback)
+        as local, and everything else as proxied traffic.
+        """
         host = (self.headers.get("Host") or "").lower()
         if not host:
             return False
-        local = "%s:%d" % (HOST, self.server.server_address[1])
-        return host.lower() not in (HOST, local, "localhost",
-                                    "localhost:%d" % self.server.server_address[1])
+        hostname, _, port = host.partition(":")
+        if hostname in ("localhost", "127.0.0.1"):
+            return False
+        try:
+            if int(port) == self.server.server_address[1]:
+                return False
+        except ValueError:
+            pass
+        return True
 
     # -- helpers ------------------------------------------------------------
     def _send(self, body, ctype, status=200, head_only=False, extra=None):

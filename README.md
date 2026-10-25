@@ -20,8 +20,10 @@ are accepted as well.
 
 ## Use it as your system / LAN proxy
 
-Set the HTTP proxy in your browser/OS internet settings to `127.0.0.1:8080`
-(and add `localhost;127.0.0.1` to the bypass/don't-proxy list):
+The proxy listens on `0.0.0.0`, so it is reachable from other machines on
+your network too. Set the HTTP proxy in your browser/OS internet settings to
+`127.0.0.1:8080` (or this machine's LAN IP for other devices), and add
+`localhost;127.0.0.1` to the bypass/don't-proxy list:
 
 - **IE6**: Tools → Internet Options → Connections → LAN settings →
   "Proxy server" → `127.0.0.1`, port `8080`.
