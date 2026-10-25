@@ -11,9 +11,12 @@ python3 ie6proxy.py [port]     # default: 8080
 ```
 
 Then browse to `http://127.0.0.1:8080/` (landing page with a URL box), or
-directly to e.g. `http://127.0.0.1:8080/p/http/example.com/`.
+directly to the target URL as a path, e.g.
+`http://127.0.0.1:8080/http://example.com/`.
 
-Proxy URL scheme: `/p/<scheme>/<host[:port]>/<path>?<query>`
+Proxy URL scheme: `/<scheme>/<host[:port]>/<path>?<query>` — the legacy
+`/p/<scheme>/...` prefix and absolute-form requests (`GET http://example.com/`)
+are accepted as well.
 
 ## What it does
 
@@ -38,7 +41,7 @@ Proxy URL scheme: `/p/<scheme>/<host[:port]>/<path>?<query>`
 - `image/webp` is converted to PNG on the fly **if Pillow is installed** (`pip install pillow`); otherwise it passes through unchanged.
 
 ### HTTPS downgrade
-All upstream fetches use plain HTTP: a `/p/https/host/...` link is fetched from `http://host/...`. (Links in rewritten pages still carry their original scheme, so mixed content behaves as it would on the open web.)
+All upstream fetches use plain HTTP: a `/https/host/...` link is fetched from `http://host/...`. (Links in rewritten pages still carry their original scheme, so mixed content behaves as it would on the open web.)
 
 ### Ad blocking
 Requests whose host matches a known ad/tracking domain (doubleclick, googlesyndication, google-analytics, googletagmanager, adnxs, taboola, outbrain, criteo, pubmatic, rubiconproject, ...) are served locally without any upstream request: an empty `204` for scripts/XHR, a transparent 1×1 GIF for image URLs. The list lives in `AD_DOMAINS` in `ie6proxy.py`.

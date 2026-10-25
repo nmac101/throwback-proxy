@@ -9,8 +9,10 @@ Usage:
 
 Then point IE6 at:
     http://127.0.0.1:8080/              (landing page with a URL box)
-or browse directly to:
-    http://127.0.0.1:8080/p/http/example.com/page.html
+or browse directly to the target URL as a path:
+    http://127.0.0.1:8080/http://example.com/page.html
+(the legacy /p/http/... form and absolute-form "GET http://..." requests
+are accepted too)
 
 How it works:
   * Every response is fetched upstream and, depending on its type:
@@ -113,7 +115,8 @@ XHTML_STRICT_DOCTYPE = (
 
 
 # ---------------------------------------------------------------------------
-# Proxy URL scheme:  /p/<scheme>/<host[:port]>/<path>?<query>
+# Proxy URL scheme:  /<scheme>/<host[:port]>/<path>?<query>
+# (the legacy "/p/<scheme>/..." prefix is also accepted)
 # ---------------------------------------------------------------------------
 def to_proxy(url):
     p = urlparse(url)
@@ -121,11 +124,11 @@ def to_proxy(url):
         return url
     path = p.path or "/"
     query = ("?" + p.query) if p.query else ""
-    return "/p/%s/%s%s%s" % (p.scheme, p.netloc, path, query)
+    return "/%s/%s%s%s" % (p.scheme, p.netloc, path, query)
 
 
 def from_proxy(path):
-    m = re.match(r"^/p/(http|https)/([^/]+)(/.*)?$", path)
+    m = re.match(r"^/(?:p/)?(http|https)(?:://|/)([^/]+)(/.*)?$", path)
     if not m:
         return None
     scheme, host, rest = m.group(1), m.group(2), (m.group(3) or "/")
@@ -452,12 +455,13 @@ LANDING = """<!DOCTYPE html>
 <p>Enter a URL to browse it through the IE6-ifying proxy:</p>
 <form onsubmit="if(this.u.value){var v=this.u.value;
 if(v.indexOf('http')!==0){v='http://'+v;}
-location.href='/p/'+v.substring(8);}return false;">
+location.href='/'+v;}return false;">
 <input type="text" name="u" size="50" value="example.com">
 <input type="submit" value="Go">
 </form>
 <p style="font-size:11px;color:#666666">
-All pages are rewritten for IE6 (HTML4, no CSS3, no flexbox) and ads are blocked.
+All pages are rewritten for IE6 (HTML4, no CSS3, no flexbox), HTTPS is
+downgraded to HTTP, and ads are blocked.
 </p>
 </center>
 </body></html>
@@ -504,17 +508,19 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- main ---------------------------------------------------------------
     def _handle(self, head_only):
-        path = urlparse(self.path).path
-
-        if path in ("/", "/index.html"):
-            self._send(LANDING, "text/html", head_only=head_only)
-            return
-
-        url = from_proxy(path)
-        if not url:
-            self._send("<html><body>Not found</body></html>", "text/html", 404,
-                       head_only)
-            return
+        # Absolute-form request target ("GET http://google.com/ HTTP/1.1").
+        if self.path.lower().startswith(("http://", "https://")):
+            url = self.path
+        else:
+            path = urlparse(self.path).path
+            if path in ("/", "/index.html"):
+                self._send(LANDING, "text/html", head_only=head_only)
+                return
+            url = from_proxy(path)
+            if not url:
+                self._send("<html><body>Not found</body></html>", "text/html",
+                           404, head_only)
+                return
 
         # --- ad blocking (no upstream request at all) ---
         if _is_ad_url(url):
