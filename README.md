@@ -18,6 +18,24 @@ Proxy URL scheme: `/<scheme>/<host[:port]>/<path>?<query>` — the legacy
 `/p/<scheme>/...` prefix and absolute-form requests (`GET http://example.com/`)
 are accepted as well.
 
+## Use it as your system / LAN proxy
+
+Set the HTTP proxy in your browser/OS internet settings to `127.0.0.1:8080`
+(and add `localhost;127.0.0.1` to the bypass/don't-proxy list):
+
+- **IE6**: Tools → Internet Options → Connections → LAN settings →
+  "Proxy server" → `127.0.0.1`, port `8080`.
+- **Modern browsers / OS**: same address in the system proxy settings
+  (e.g. Windows Settings → Network → Proxy, or Firefox → Settings → Network
+  → Manual proxy).
+
+In this mode the browser sends absolute-form requests for `http://` sites
+(proxied directly) and `CONNECT host:443` tunnels for `https://` sites.
+The tunnel is terminated with a self-signed certificate generated at startup
+(via the `openssl` CLI), so browsers show a certificate warning once per
+site; after you accept it, the request is downgraded to plain HTTP upstream.
+Without `openssl`, `http://` sites still work but `https://` ones fail.
+
 ## What it does
 
 ### HTML (text/html)

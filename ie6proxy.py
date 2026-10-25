@@ -14,6 +14,10 @@ or browse directly to the target URL as a path:
 (the legacy /p/http/... form and absolute-form "GET http://..." requests
 are accepted too)
 
+It can also be set as the system/LAN proxy (127.0.0.1:8080): absolute-form
+requests are proxied directly, and CONNECT tunnels for HTTPS sites are
+terminated with a self-signed certificate and downgraded to HTTP upstream.
+
 How it works:
   * Every response is fetched upstream and, depending on its type:
       - text/html : HTML5 tags are down-converted (section->div, ...),
@@ -33,13 +37,18 @@ How it works:
     empty response (204) or a transparent 1x1 GIF, without touching the
     network at all.
 
-Only the Python standard library is required. Pillow is optional (webp).
+Only the Python standard library is required. Pillow is optional (webp);
+the openssl CLI is optional (enables CONNECT/TLS for system-proxy mode).
 """
 
 import colorsys
 import io
+import os
 import re
+import ssl
+import subprocess
 import sys
+import tempfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urljoin, urlparse
@@ -442,6 +451,31 @@ def transform_html(html, base):
 # ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
+def _make_tls_context():
+    """Self-signed cert via the openssl CLI, cached in a temp dir."""
+    d = os.path.join(tempfile.gettempdir(), "ie6proxy-tls")
+    os.makedirs(d, exist_ok=True)
+    cert, key = os.path.join(d, "cert.pem"), os.path.join(d, "key.pem")
+    if not (os.path.exists(cert) and os.path.exists(key)):
+        try:
+            subprocess.run(
+                [
+                    "openssl", "req", "-x509", "-newkey", "rsa:2048",
+                    "-keyout", key, "-out", cert, "-days", "3650",
+                    "-nodes", "-subj", "/CN=IE6Proxy",
+                ],
+                check=True, capture_output=True,
+            )
+        except (OSError, subprocess.CalledProcessError):
+            return None
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(cert, key)
+        return ctx
+    except (ssl.SSLError, OSError):
+        return None
+
+
 def _is_ad_url(url):
     host = urlparse(url).netloc.lower().split(":")[0]
     return any(host == d or host.endswith("." + d) for d in AD_DOMAINS)
@@ -473,6 +507,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
+
+    def _is_foreign_host(self):
+        """True when the Host header points at a site other than this proxy."""
+        host = (self.headers.get("Host") or "").lower()
+        if not host:
+            return False
+        local = "%s:%d" % (HOST, self.server.server_address[1])
+        return host.lower() not in (HOST, local, "localhost",
+                                    "localhost:%d" % self.server.server_address[1])
 
     # -- helpers ------------------------------------------------------------
     def _send(self, body, ctype, status=200, head_only=False, extra=None):
@@ -506,11 +549,41 @@ class Handler(BaseHTTPRequestHandler):
         self._send("<html><body>POST is not proxied by IE6Proxy.</body></html>",
                    "text/html", 405)
 
+    def do_CONNECT(self):
+        # System-proxy mode: the browser tunnels an HTTPS site through us.
+        # Answer 200, terminate TLS with our self-signed cert, then let the
+        # handle() loop read the real (origin-form) request over the tunnel;
+        # it is downgraded to plain HTTP upstream.
+        self.send_response_only(200)
+        self.end_headers()
+        ctx = getattr(self.server, "ssl_ctx", None)
+        if ctx is None:
+            self.wfile.write(
+                b"CONNECT failed: openssl not found (no TLS support)\r\n"
+            )
+            self.close_connection = True
+            return
+        try:
+            tls = ctx.wrap_socket(self.connection, server_side=True)
+        except (ssl.SSLError, OSError):
+            self.close_connection = True
+            return
+        self.connection = tls
+        self.rfile = tls.makefile("rb", self.rbufsize)
+        self.wfile = tls.makefile("wb")
+        self.close_connection = False
+
     # -- main ---------------------------------------------------------------
     def _handle(self, head_only):
         # Absolute-form request target ("GET http://google.com/ HTTP/1.1").
         if self.path.lower().startswith(("http://", "https://")):
             url = self.path
+        elif self._is_foreign_host():
+            # Origin-form request from a system proxy (after CONNECT or as a
+            # plain proxied request): the target is in the Host header.
+            url = "http://%s%s" % (
+                self.headers.get("Host"), self.path
+            )
         else:
             path = urlparse(self.path).path
             if path in ("/", "/index.html"):
@@ -589,8 +662,15 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_PORT
     srv = ThreadingHTTPServer((HOST, port), Handler)
+    srv.ssl_ctx = _make_tls_context()
     print("IE6 proxy listening on http://%s:%d/" % (HOST, port))
-    print("Try:  http://%s:%d/p/http/example.com/" % (HOST, port))
+    print("Try:  http://%s:%d/http://example.com/" % (HOST, port))
+    print("Or set it as your LAN/system proxy: %s:%d" % (HOST, port))
+    if srv.ssl_ctx is None:
+        print(
+            "Note: openssl not found -- CONNECT (HTTPS sites in "
+            "system-proxy mode) is disabled."
+        )
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
