@@ -26,6 +26,7 @@ How it works:
                     unsupported properties and selectors are dropped, and
                     url() references are rewritten through the proxy.
       - image/webp: converted to PNG on the fly (if Pillow is installed).
+  * All upstream HTTPS requests are transparently downgraded to HTTP.
   * Requests whose host matches a known ad/tracking domain are served an
     empty response (204) or a transparent 1x1 GIF, without touching the
     network at all.
@@ -524,6 +525,9 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._send(b"", "text/plain", 204, head_only)
             return
+
+        # Downgrade HTTPS to HTTP for the upstream fetch (IE6-era trust).
+        url = re.sub(r"^https://", "http://", url)
 
         # --- fetch upstream ---
         req = Request(

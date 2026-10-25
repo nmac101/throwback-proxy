@@ -37,6 +37,9 @@ Proxy URL scheme: `/p/<scheme>/<host[:port]>/<path>?<query>`
 ### Images
 - `image/webp` is converted to PNG on the fly **if Pillow is installed** (`pip install pillow`); otherwise it passes through unchanged.
 
+### HTTPS downgrade
+All upstream fetches use plain HTTP: a `/p/https/host/...` link is fetched from `http://host/...`. (Links in rewritten pages still carry their original scheme, so mixed content behaves as it would on the open web.)
+
 ### Ad blocking
 Requests whose host matches a known ad/tracking domain (doubleclick, googlesyndication, google-analytics, googletagmanager, adnxs, taboola, outbrain, criteo, pubmatic, rubiconproject, ...) are served locally without any upstream request: an empty `204` for scripts/XHR, a transparent 1×1 GIF for image URLs. The list lives in `AD_DOMAINS` in `ie6proxy.py`.
 
