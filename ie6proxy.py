@@ -127,13 +127,18 @@ XHTML_STRICT_DOCTYPE = (
 # Proxy URL scheme:  /<scheme>/<host[:port]>/<path>?<query>
 # (the legacy "/p/<scheme>/..." prefix is also accepted)
 # ---------------------------------------------------------------------------
-def to_proxy(url):
+def to_proxy(url, abs_base=None):
     p = urlparse(url)
     if p.scheme not in ("http", "https") or not p.netloc:
         return url
     path = p.path or "/"
     query = ("?" + p.query) if p.query else ""
-    return "/%s/%s%s%s" % (p.scheme, p.netloc, path, query)
+    rel = "/%s/%s%s%s" % (p.scheme, p.netloc, path, query)
+    # abs_base (e.g. "http://192.168.1.5:8080"): emit an absolute URL so the
+    # link still reaches the proxy when the page's own URL is on another host
+    # (system-proxy mode, where the browser resolves relatives against the
+    # origin site, not against us).
+    return (abs_base + rel) if abs_base else rel
 
 
 def from_proxy(path):
@@ -385,13 +390,13 @@ def _eval_calc(inner):
     return inner  # leave it; IE6 will simply ignore the declaration
 
 
-def _rewrite_css_urls(css, base):
+def _rewrite_css_urls(css, base, abs_base=None):
     def sub(m):
         inner = m.group(2).strip().strip("'\''")
         if not inner or inner.lower().startswith(("data:", "#")):
             return m.group(0)
         absu = urljoin(base, inner)
-        return 'url("%s")' % to_proxy(absu)
+        return 'url("%s")' % to_proxy(absu, abs_base)
 
     return re.sub(r"url\(\s*(['\"]?)(.*?)\1\s*\)", sub, css)
 
@@ -410,7 +415,7 @@ def _filter_rules(css):
     return re.sub(r"([^{}]+)\{([^{}]*)\}", sub, css)
 
 
-def transform_css(css, base):
+def transform_css(css, base, abs_base=None):
     css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
     css = _strip_at_blocks(
         css, ["font-face", "keyframes", "-webkit-keyframes", "-moz-keyframes"]
@@ -444,7 +449,7 @@ def transform_css(css, base):
         lambda m: "%dpx" % round(float(m.group(1)) * 7.68),
         css,
     )
-    css = _rewrite_css_urls(css, base)
+    css = _rewrite_css_urls(css, base, abs_base)
     css = _filter_rules(css)
     return css
 
@@ -478,7 +483,7 @@ ATTR_RE = re.compile(
 SKIP_URL_PREFIXES = ("data:", "#", "javascript:", "mailto:", "tel:", "about:")
 
 
-def _rewrite_attrs(tag, base):
+def _rewrite_attrs(tag, base, abs_base=None):
     def sub(a):
         name = a.group(1).lower()
         val = next(g for g in a.groups()[1:] if g is not None)
@@ -494,14 +499,14 @@ def _rewrite_attrs(tag, base):
                 return a.group(0)
             absu = urljoin(base, v)
             if urlparse(absu).scheme in ("http", "https"):
-                v = to_proxy(absu)
+                v = to_proxy(absu, abs_base)
             return '%s="%s"' % (a.group(1), v)
         return a.group(0)
 
     return ATTR_RE.sub(sub, tag)
 
 
-def transform_html(html, base):
+def transform_html(html, base, abs_base=None):
     # <base href> changes how relative URLs resolve -- honour it first.
     bm = re.search(r"<base[^>]+href\s*=\s*['\"]([^'\"]+)['\"]", html, re.I)
     if bm:
@@ -574,7 +579,9 @@ def transform_html(html, base):
 
     # Rewrite every tag's URL-bearing attributes through the proxy.
     html = re.sub(
-        r"<[a-zA-Z][^>]*>", lambda m: _rewrite_attrs(m.group(0), base), html
+        r"<[a-zA-Z][^>]*>",
+        lambda m: _rewrite_attrs(m.group(0), base, abs_base),
+        html,
     )
     return html
 
@@ -659,6 +666,17 @@ class Handler(BaseHTTPRequestHandler):
             pass
         return True
 
+    def _abs_base(self):
+        """Absolute base URL clients can use to reach this proxy.
+
+        In system-proxy mode the page's own URL is on the origin host, so
+        rewritten links must be absolute to keep resolving back to us. The
+        client's source IP is the address it used to reach us.
+        """
+        return "http://%s:%d" % (
+            self.client_address[0], self.server.server_address[1]
+        )
+
     # -- helpers ------------------------------------------------------------
     def _send(self, body, ctype, status=200, head_only=False, extra=None):
         if isinstance(body, str):
@@ -717,15 +735,24 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- main ---------------------------------------------------------------
     def _handle(self, head_only):
+        abs_base = None
         # Absolute-form request target ("GET http://google.com/ HTTP/1.1").
         if self.path.lower().startswith(("http://", "https://")):
             url = self.path
+            # Tolerate a doubled proxy path ("http://host/http/host2/..."):
+            # the browser resolved one of our rewritten links against the
+            # origin site instead of the proxy.
+            m = re.match(r"^https?://[^/]+(/.*)$", self.path, re.I)
+            if m and from_proxy(m.group(1)):
+                url = from_proxy(m.group(1))
+            abs_base = self._abs_base()
         elif self._is_foreign_host():
             # Origin-form request from a system proxy (after CONNECT or as a
             # plain proxied request): the target is in the Host header.
             url = "http://%s%s" % (
                 self.headers.get("Host"), self.path
             )
+            abs_base = self._abs_base()
         else:
             path = urlparse(self.path).path
             if path in ("/", "/index.html"):
@@ -765,7 +792,7 @@ class Handler(BaseHTTPRequestHandler):
             body = e.read()
             if 300 <= e.code < 400 and e.headers.get("Location"):
                 loc = urljoin(url, e.headers["Location"])
-                self._redirect(to_proxy(loc))
+                self._redirect(to_proxy(loc, abs_base))
                 return
             self._send(body, e.headers.get_content_type() or "text/plain",
                        e.code, head_only)
@@ -786,12 +813,12 @@ class Handler(BaseHTTPRequestHandler):
         # --- transform by type ---
         if ctype == "text/html":
             text = body.decode(charset, errors="replace")
-            text = transform_html(text, url)
+            text = transform_html(text, url, abs_base)
             self._send(text, "text/html", 200, head_only)
             return
         if ctype == "text/css":
             text = body.decode(charset, errors="replace")
-            text = transform_css(text, url)
+            text = transform_css(text, url, abs_base)
             self._send(text, "text/css", 200, head_only)
             return
         if ctype == "image/webp" and _webp_to_png:
