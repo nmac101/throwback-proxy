@@ -81,7 +81,8 @@ def _svg_to_png(data):
         return None
     try:
         r = subprocess.run(
-            [_IM, "-background", "transparent", "svg:-", "png:-"],
+            [_IM, "-background", "transparent", "-depth", "8",
+             "svg:-", "png:-"],
             input=data, capture_output=True, timeout=15,
         )
         if r.returncode == 0 and r.stdout:
@@ -1302,14 +1303,22 @@ def _bg_image_classes(css):
         )
         if not bm:
             continue
+        # explicit px geometry from the same rule: IE6 mishandles
+        # percentage widths on <img> inside floats, so the injected img
+        # gets pixel dimensions whenever the rule provides them
+        wm = re.search(r"(?<![\w-])width\s*:\s*(\d+)px", body, re.I)
+        hm = re.search(r"(?<![\w-])height\s*:\s*(\d+)px", body, re.I)
+        entry = (bm.group(2), sm.group(1).lower(),
+                 int(wm.group(1)) if wm else None,
+                 int(hm.group(1)) if hm else None)
         # only the LAST class/id of the selector (most specific) -- mapping
         # ancestor classes too would inject the img into their elements
         cls = re.findall(r"\.([A-Za-z_][\w-]*)", rm.group(1))
         if cls:
-            out[cls[-1]] = (bm.group(2), sm.group(1).lower())
+            out[cls[-1]] = entry
         ids = re.findall(r"#([A-Za-z_][\w-]*)", rm.group(1))
         if ids:
-            out["#" + ids[-1]] = (bm.group(2), sm.group(1).lower())
+            out["#" + ids[-1]] = entry
     return out
 
 
@@ -1339,8 +1348,14 @@ def _bg_image_elements(html, bg, base, abs_base=None):
                         break
         if not hit:
             continue
-        raw_url, _size = hit
+        raw_url, size, px_w, px_h = hit
         img_url = to_proxy(urljoin(base, html_unescape(raw_url)), abs_base)
+        if px_w:
+            img_style = "width:%dpx" % px_w
+            if size == "cover" and px_h:  # cover ~ stretch in IE6
+                img_style += ";height:%dpx" % px_h
+        else:
+            img_style = "width:100%"
         tag_text = html[m.start():m.end()]
         if re.search(r"\bstyle\s*=\s*[\"']", tag_text, re.I):
             tag_text = re.sub(
@@ -1350,10 +1365,8 @@ def _bg_image_elements(html, bg, base, abs_base=None):
             )
         else:
             tag_text = tag_text[:-1] + ' style="background-image:none;">'
-        img = (
-            '<img src="%s" alt="" '
-            'style="display:block;width:100%%;border:0">' % img_url
-        )
+        img = ('<img src="%s" alt="" '
+               'style="display:block;%s;border:0">' % (img_url, img_style))
         edits.append((m.start(), m.end(), tag_text + img))
     for start, end, repl in sorted(edits, reverse=True):
         html = html[:start] + repl + html[end:]
