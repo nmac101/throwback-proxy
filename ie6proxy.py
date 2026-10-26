@@ -986,10 +986,24 @@ def _pin_fixed_elements(html, pinned):
             continue
         pid = "ie6pin-%d" % len(ids)
         ids.append(pid)
-        edits.append((m.start(), m.end(), pid))
-    for start, end, pid in sorted(edits, reverse=True):
+        edits.append((m.start(), m.end(), pid,
+                      "ie6bg" in (cm.group(1) if cm else "")))
+    for start, end, pid, is_bg in sorted(edits, reverse=True):
         tag = html[start:end]
-        html = html[:start] + tag[:-1] + ' id="%s">' % pid + html[end:]
+        new = tag[:-1] + ' id="%s"' % pid
+        if not is_bg:
+            # IE6 paints filtered elements (like the body-gradient div)
+            # above z-index:auto positioned siblings; an explicit z-index
+            # keeps pinned content on top of it.
+            if re.search(r"\bstyle\s*=\s*[\"']", new, re.I):
+                new = re.sub(
+                    r"(\bstyle\s*=\s*[\"'])([^\"']*)",
+                    lambda mm: mm.group(1) + mm.group(2) + "z-index:1;",
+                    new, count=1, flags=re.I,
+                )
+            else:
+                new += ' style="z-index:1"'
+        html = html[:start] + new + ">" + html[end:]
     if not ids:
         return html
     script = PIN_SCRIPT % ",".join('"%s"' % i for i in ids)
