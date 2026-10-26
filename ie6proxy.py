@@ -432,6 +432,17 @@ def _transform_decls(body):
             v = "absolute"
             fixed = True
         decls.append("%s: %s" % (prop.strip(), v))
+    # IE6 ignores max-width, and margin:auto only centres a block that has
+    # an explicit width -- so the ubiquitous "max-width + margin:auto"
+    # centring idiom (very common on <body>) becomes a plain fixed width.
+    mw = re.search(r"(?<![\w-])max-width\s*:\s*([^;]+)", body, re.I)
+    if mw and not re.search(r"(?<![\w-])width\s*:\s*", body, re.I) \
+            and re.search(
+                r"(?<![\w-])margin(?:-left|-right)?\s*:\s*[^;]*\bauto\b",
+                body, re.I):
+        decls = [d for d in decls
+                 if not re.match(r"\s*max-width\s*:", d, re.I)]
+        decls.append("width: %s" % mw.group(1).strip())
     # No extra work for fixed/sticky here: the element is absolute with its
     # static top/left kept, and the HTML step (_pin_fixed_elements) adds a
     # JS scroll handler.  CSS expression() -- the classic IE6 "position:
@@ -1563,6 +1574,17 @@ class Handler(BaseHTTPRequestHandler):
                     bottom |= _margin_auto_classes(scss)
                     body_filter = body_filter or _body_gradient_filter(scss)
             text = transform_html(text, url, abs_base)
+
+            def _style_block(m):
+                return "<style>%s</style>" % transform_css(
+                    m.group(1), url, abs_base)
+
+            # Inline <style> blocks need the same treatment as linked
+            # stylesheets (nmac.me-style external CSS alone never exposed
+            # this; sites with inline CSS like example.com do).
+            text = re.sub(
+                r"<style\b[^>]*>(.*?)</style\s*>",
+                _style_block, text, flags=re.I | re.S)
             text = _bg_image_elements(text, bg, url, abs_base)
             if body_filter:
                 # IE6 can't filter body: paint the gradient on a pinned,

@@ -61,6 +61,8 @@ Without `openssl`, `http://` sites still work but `https://` ones fail.
   - Filters are dropped from `body`/`html` rules: IE6 ignores them there, and a filter on an ancestor breaks the filters of all descendants (which is why page gradients can die when the body has e.g. a text-shadow). A `body` gradient background is repainted on a pinned, full-viewport `z-index:-1` div injected after `<body>` (matching `background-attachment: fixed`).
 - `rgba()`/`hsl()` → `rgb()`.
 - `calc()` evaluated when possible; `vw`/`vh` approximated as px (assuming a 1024×768 screen) in the CSS, and elements sized in `vw`/`vh` additionally get a JS resize handler so they track the real window size (padding subtracted to approximate `box-sizing: border-box`).
+- Inline `<style>` blocks get the same treatment as linked stylesheets (sites like example.com keep all their CSS inline).
+- `max-width` + `margin: auto` (the common centring idiom, e.g. on `body`) → plain `width`: IE6 ignores `max-width`, and `margin: auto` only centres a block with an explicit width.
 - Unsupported properties (`border-radius`, `transform`, `transition`, `animation`, ...) and selectors (`:not()`, `:nth-*`, `:is()`, `:where()`, `:has()`, ...) removed.
 - `::pseudo` → `:pseudo`; all `url()` references rewritten through the proxy.
 
