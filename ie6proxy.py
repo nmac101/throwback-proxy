@@ -529,8 +529,144 @@ def _body_gradient_filter(css):
     return None
 
 
+def _flatten_css(css):
+    """Flatten CSS nesting (nested rules, `&` parent references) into flat
+    rules.  IE6 knows no nesting; a nested rule's declarations are simply
+    invisible to it.  Statement at-rules (@import) and block at-rules
+    (@media, ...) are passed through verbatim."""
+    out = []
+
+    def find_close(s, i):
+        """Index of the close brace matching the open brace at s[i]."""
+        depth = 0
+        while i < len(s):
+            if s[i] == "{":
+                depth += 1
+            elif s[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    return i
+            i += 1
+        return len(s) - 1
+
+    def resolve(sel, parent):
+        """Resolve a (possibly `&`-referencing) selector against its parent.
+        Returns None for `&` rules with no parent (unresolvable)."""
+        if "&" in sel:
+            return sel.replace("&", parent) if parent else None
+        return (parent + " " + sel) if parent else sel
+
+    def emit_rule(sel, body):
+        # split the body into top-level declarations and nested rules
+        top, nested, j, m, decl_start = [], [], 0, len(body), 0
+        while j < m:
+            if body[j] == "{":
+                nsel = body[decl_start:j].strip().rstrip(";").strip()
+                nclose = find_close(body, j)
+                if nsel:
+                    rsel = resolve(nsel, sel)
+                    if rsel:
+                        nested.append((rsel, body[j + 1:nclose]))
+                j = nclose + 1
+                decl_start = j
+            elif body[j] == ";":
+                d = body[decl_start:j].strip()
+                if d:
+                    top.append(d)
+                j += 1
+                decl_start = j
+            else:
+                j += 1
+        tail = body[decl_start:].strip()
+        if tail:
+            top.append(tail)
+        if top:
+            out.append(sel + " { " + "; ".join(top) + " }")
+        for nsel, nbody in nested:  # parent first (cascade order)
+            emit_rule(nsel, nbody)
+
+    def parse_rules(text):
+        i, n = 0, len(text)
+        while i < n:
+            c = text[i]
+            if c in " \t\r\n;":
+                i += 1
+                continue
+            if c == "}":
+                i += 1
+                continue
+            brace = text.find("{", i)
+            if brace == -1:
+                break
+            semi = text.find(";", i)
+            if semi != -1 and semi < brace:
+                # statement at-rule (e.g. @import "x.css";)
+                out.append(text[i:semi + 1])
+                i = semi + 1
+                continue
+            sel = text[i:brace].strip()
+            close = find_close(text, brace)
+            body = text[brace + 1:close]
+            i = close + 1
+            if not sel:
+                continue
+            if sel.startswith("@"):
+                out.append(sel + " {" + body + "}")
+                continue
+            emit_rule(sel, body)
+
+    parse_rules(css)
+    return "\n".join(out)
+
+
+def _resolve_vars(css):
+    """Substitute var(--name[, fallback]) using --name definitions from
+    :root and from the same rule, then drop the custom-property
+    declarations.  Unresolvable vars drop their declaration's value part
+    (IE6 would ignore the declaration anyway)."""
+    # Custom properties inherit in CSS; the common pattern is defining them
+    # on a component's root rule and using them in nested rules, so pool
+    # every definition in the sheet (later rules win, cascade-ish).
+    sheet_vars = {}
+    for dm in re.finditer(r"(--[\w-]+)\s*:\s*([^;{}]+)", css):
+        sheet_vars[dm.group(1)] = dm.group(2).strip()
+
+    def sub(text, local):
+        env = dict(sheet_vars)
+        env.update(local)
+
+        def rep(m):
+            name, fb = m.group(1), m.group(2)
+            if name in env:
+                return env[name]
+            return fb.strip() if fb else ""
+
+        prev = None
+        while prev != text:  # values may reference other vars
+            prev = text
+            text = re.sub(
+                r"var\(\s*(--[\w-]+)\s*(?:,\s*([^)]*))?\)", rep, text)
+        return re.sub(r"(^|;)\s*--[\w-]+\s*:\s*[^;]+",
+                      lambda m: m.group(1), text)
+
+    def walk(m):
+        sel, body = m.group(1), m.group(2)
+        local = dict(re.findall(r"(--[\w-]+)\s*:\s*([^;]+)", body))
+        local = {k: v.strip() for k, v in local.items()}
+        return sel + "{" + sub(body, local) + "}"
+
+    return re.sub(r"([^{}]+)\{([^{}]*)\}", walk, css)
+
+
 def transform_css(css, base, abs_base=None):
     css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+    css = _flatten_css(css)
+    css = _resolve_vars(css)
+    # Fully-transparent rgba() -> nothing: a 4-value rgb() in a shorthand
+    # (e.g. `background: rgba(0,0,0,0) url(...)`) invalidates the whole
+    # declaration in IE6 and would drop the image layer with it.
+    css = re.sub(
+        r"(?:rgba|rgb)\(\s*0\s*,\s*0\s*,\s*0\s*,\s*0\s*\)\s*", "", css, re.I)
     css = _strip_at_blocks(
         css, ["font-face", "keyframes", "-webkit-keyframes", "-moz-keyframes"]
     )
@@ -542,6 +678,7 @@ def transform_css(css, base, abs_base=None):
         r"rgba\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*([\d.]+%?)\s*\)",
         r"rgb(\1,\2,\3,\4)", css, re.I,
     )
+    css = re.sub(r"\s{2,}", " ", css)
     css = re.sub(
         r"rgba\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)", r"rgb(\1,\2,\3)", css, re.I
     )

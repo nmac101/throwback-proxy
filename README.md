@@ -62,6 +62,8 @@ Without `openssl`, `http://` sites still work but `https://` ones fail.
 - `rgba()`/`hsl()` → `rgb()`.
 - `calc()` evaluated when possible; `vw`/`vh` approximated as px (assuming a 1024×768 screen) in the CSS, and elements sized in `vw`/`vh` additionally get a JS resize handler so they track the real window size (padding subtracted to approximate `box-sizing: border-box`).
 - Inline `<style>` blocks get the same treatment as linked stylesheets (sites like example.com keep all their CSS inline).
+- **CSS nesting is flattened** (nested rules and `&` parent references, as used by archlinux.org's navbar) and **custom properties are resolved**: `var(--name[, fallback])` is substituted from `--name` definitions in the sheet (custom properties inherit in CSS, so definitions on a component's root rule reach its nested rules), and the `--*` declarations are dropped.
+- Fully-transparent `rgba(0,0,0,0)` / 4-value `rgb(0,0,0,0)` is dropped from shorthand values: a 4-value `rgb()` would invalidate the whole declaration in IE6 and take e.g. the `url()` layer of a `background` shorthand down with it.
 - `max-width` + `margin: auto` (the common centring idiom, e.g. on `body`) → plain `width`: IE6 ignores `max-width`, and `margin: auto` only centres a block with an explicit width.
 - Unsupported properties (`border-radius`, `transform`, `transition`, `animation`, ...) and selectors (`:not()`, `:nth-*`, `:is()`, `:where()`, `:has()`, ...) removed.
 - `::pseudo` → `:pseudo`; all `url()` references rewritten through the proxy.
