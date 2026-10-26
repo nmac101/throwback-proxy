@@ -8,11 +8,16 @@ def to_proxy(url, abs_base=None):
     p = urlparse(url)
     if p.scheme not in ("http", "https") or not p.netloc:
         return url
+    # IE6 has no TLS support: downgrade every https URL to http so the
+    # links and resources actually load (upstream fetches are downgraded
+    # the same way, so the host serves the http variant).
+    if p.scheme == "https":
+        p = p._replace(scheme="http")
     # System-proxy mode (abs_base set): the browser is configured to send
     # every http request to this proxy in absolute form, so links can keep
     # their original URL -- no /<scheme>/<host>/... wrapping needed.
     if abs_base:
-        return url
+        return p.geturl()
     path = p.path or "/"
     query = ("?" + p.query) if p.query else ""
     return "/%s/%s%s%s" % (p.scheme, p.netloc, path, query)

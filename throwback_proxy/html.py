@@ -83,10 +83,13 @@ def _rewrite_attrs(tag, base, abs_base=None):
         if name == "srcset":
             return ""
         if name == "style":
-            return 'style="%s"' % _rewrite_css_urls(_transform_decls(val), base).replace(
-                '"', "'"
-            )
-        if name in ("src", "href", "poster") and val:
+            return 'style="%s"' % _rewrite_css_urls(
+                _transform_decls(val), base, abs_base
+            ).replace('"', "'")
+        # src/href/poster are the usual URL attributes; resource and
+        # content are MediaWiki's lazy-load URL attributes (IE6 never runs
+        # the lazy-load JS, but the URLs should still be http).
+        if name in ("src", "href", "poster", "resource", "content") and val:
             v = val.strip()
             if v.lower().startswith(SKIP_URL_PREFIXES):
                 return a.group(0)
