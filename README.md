@@ -51,6 +51,7 @@ Without `openssl`, `http://` sites still work but `https://` ones fail.
 - `position: fixed`/`sticky` → `absolute` plus a small JS scroll handler injected before `</body>` that keeps the element in place while the page scrolls (IE6 ignores CSS `expression()` in the standards mode the proxy forces via the doctype). The element's top/left offset is preserved. (Offsets given via `bottom`/`right` are not preserved.)
 - **Modern effects are approximated with IE6's DXImageTransform filters** rather than just dropped:
   - `linear-gradient()` / `radial-gradient()` → `DXImageTransform.Microsoft.Gradient` (end colors + nearest cardinal direction; `radial-gradient(... at <pos>)` points away from `<pos>`), with the first stop kept as a solid `background-color` fallback. Multi-layer backgrounds (gradient over `url(...)`) keep the image as `background-image`, with the gradient painted over it as the filter.
+  - Elements with `background(-image)` + `background-size: cover|contain` get the image replaced by a nested `<img style="width:100%">` (IE6 can't scale background images, and such divs usually have no height of their own); the element's own `background-image` is suppressed inline.
   - `rgba()` alpha is preserved for the filters (as 8-digit `#AARRGGBB`); in plain CSS properties the 4-value `rgb()` form is left for IE6 to ignore.
   - `box-shadow` / `text-shadow` → `DXImageTransform.Microsoft.DropShadow` (first shadow only; `inset` dropped).
   - All filter colors are emitted as 8-digit `#AARRGGBB` — the DXImageTransform filters silently fail on 6-digit `#RRGGBB`.

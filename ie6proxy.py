@@ -1063,6 +1063,75 @@ def _viewport_elements(html, vp):
     return html
 
 
+def _bg_image_classes(css):
+    """Class -> (url, 'cover'|'contain') for rules with a background image
+    AND background-size.  IE6 can't scale background images (and a
+    width:100%-ish div with no height collapses to nothing), so the HTML
+    step replaces the image with a nested <img> that scales like cover."""
+    out = {}
+    for rm in re.finditer(r"([^{}]+)\{([^{}]*)\}", css):
+        body = rm.group(2)
+        sm = re.search(r"background-size\s*:\s*(cover|contain)", body, re.I)
+        if not sm:
+            continue
+        bm = re.search(
+            r"(?<![\w-])background(?:-image)?\s*:\s*[^;]*?url\(\s*(['\"]?)(.*?)\1\s*\)",
+            body, re.I,
+        )
+        if not bm:
+            continue
+        # only the LAST class of the selector (most specific) -- mapping
+        # ancestor classes too would inject the img into their elements
+        cls = re.findall(r"\.([A-Za-z_][\w-]*)", rm.group(1))
+        if cls:
+            out[cls[-1]] = (bm.group(2), sm.group(1).lower())
+    return out
+
+
+def _bg_image_elements(html, bg, base, abs_base=None):
+    """Inject a scaling <img> as the first child of elements whose class has
+    a background image with background-size (see _bg_image_classes), and
+    suppress the element's own background image (the nested img replaces
+    it; without this both would paint, misaligned)."""
+    if not bg:
+        return html
+    edits = []
+    for m in re.finditer(r"<([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)>", html):
+        tag = m.group(1).lower()
+        if tag in _VOID_TAGS or tag == "img":
+            continue
+        attrs = m.group(2) or ""
+        cm = re.search(r'class\s*=\s*["\']([^"\']*)["\']', attrs, re.I)
+        if not cm:
+            continue
+        hit = None
+        for cls in set(cm.group(1).split()):
+            if cls in bg:
+                hit = bg[cls]
+                break
+        if not hit:
+            continue
+        raw_url, _size = hit
+        img_url = to_proxy(urljoin(base, html_unescape(raw_url)), abs_base)
+        tag_text = html[m.start():m.end()]
+        if re.search(r"\bstyle\s*=\s*[\"']", tag_text, re.I):
+            tag_text = re.sub(
+                r"(\bstyle\s*=\s*[\"'])([^\"']*)",
+                lambda mm: mm.group(1) + mm.group(2) + "background-image:none;",
+                tag_text, count=1, flags=re.I,
+            )
+        else:
+            tag_text = tag_text[:-1] + ' style="background-image:none;">'
+        img = (
+            '<img src="%s" alt="" '
+            'style="display:block;width:100%%;border:0">' % img_url
+        )
+        edits.append((m.start(), m.end(), tag_text + img))
+    for start, end, repl in sorted(edits, reverse=True):
+        html = html[:start] + repl + html[end:]
+    return html
+
+
 def _make_tls_context():
     """Self-signed cert via the openssl CLI, cached in a temp dir."""
     d = os.path.join(tempfile.gettempdir(), "ie6proxy-tls")
@@ -1286,6 +1355,7 @@ class Handler(BaseHTTPRequestHandler):
             widths = {}
             pinned = set()
             vp = {}
+            bg = {}
             for sm in re.finditer(r"<style\b[^>]*>(.*?)</style\s*>",
                                   text, re.I | re.S):
                 flex_classes |= _flex_container_classes(sm.group(1))
@@ -1293,6 +1363,7 @@ class Handler(BaseHTTPRequestHandler):
                 pinned |= _pinned_classes(sm.group(1))
                 for k, v in _viewport_classes(sm.group(1)).items():
                     vp.setdefault(k, []).extend(v)
+                bg.update(_bg_image_classes(sm.group(1)))
             for lm in re.finditer(r"<link\b[^>]*>", text, re.I):
                 tag = lm.group(0)
                 if not re.search(r'rel\s*=\s*["\']?stylesheet', tag, re.I):
@@ -1312,7 +1383,9 @@ class Handler(BaseHTTPRequestHandler):
                     pinned |= _pinned_classes(scss)
                     for k, v in _viewport_classes(scss).items():
                         vp.setdefault(k, []).extend(v)
+                    bg.update(_bg_image_classes(scss))
             text = transform_html(text, url, abs_base)
+            text = _bg_image_elements(text, bg, url, abs_base)
             text = _flex_row_layout(text, flex_classes, widths, pinned)
             text = _pin_fixed_elements(text, pinned)
             text = _viewport_elements(text, vp)
