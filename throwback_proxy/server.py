@@ -12,7 +12,8 @@ from html import unescape as html_unescape
 from urllib.parse import urljoin, urlparse
 
 from .ads import _is_ad_url
-from .config import (DEFAULT_PORT, HOST, TRANSPARENT_GIF,
+from .config import (DEFAULT_PORT, FIX_IE_CSS_LIMIT_JS,
+                     FIX_IE_CSS_LIMIT_PATH, HOST, TRANSPARENT_GIF,
                      XHTML_STRICT_DOCTYPE)
 from .css import _body_gradient_filter, transform_css
 from .fetch import http_get
@@ -176,6 +177,13 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- main ---------------------------------------------------------------
     def _handle(self, head_only):
+        # Internal static assets (injected into every proxied page); match in
+        # both origin-form (/path) and absolute-form (http://host/path).
+        if urlparse(self.path).path == FIX_IE_CSS_LIMIT_PATH:
+            self._send(FIX_IE_CSS_LIMIT_JS, "application/javascript", 200,
+                       head_only,
+                       {"Cache-Control": "max-age=86400"})
+            return
         abs_base = None
         # Absolute-form request target ("GET http://google.com/ HTTP/1.1").
         if self.path.lower().startswith(("http://", "https://")):

@@ -5,6 +5,7 @@ import re
 from urllib.parse import urljoin, urlparse
 
 from .config import XHTML_STRICT_DOCTYPE
+from .config import FIX_IE_CSS_LIMIT_PATH
 from .css import _rewrite_css_urls, _transform_decls
 from .urls import to_proxy
 
@@ -215,4 +216,19 @@ def transform_html(html, base, abs_base=None):
         lambda m: _rewrite_attrs(m.group(0), base, abs_base),
         html,
     )
+
+    # IE6 31-stylesheet-limit fix: inject after the <link> tags (i.e. just
+    # before </head>) so it runs once every stylesheet is in the DOM.  The
+    # src points at the proxy's own internal path -- absolute in
+    # system-proxy mode (the page is served as if from the origin host),
+    # relative otherwise.  Done after the attribute rewrite so the src is
+    # not re-wrapped in the proxy path scheme.
+    if re.search(r"</head\s*>", html, re.I):
+        script = '<script src="%s"></script>' % (
+            (abs_base or "") + FIX_IE_CSS_LIMIT_PATH
+        )
+        html = re.sub(
+            r"</head\s*>", lambda m: script + m.group(0),
+            html, count=1, flags=re.I,
+        )
     return html
