@@ -685,14 +685,32 @@ _VOID_TAGS = set(
 )
 
 
-def _flex_row_inline(html, flex_classes):
-    """IE6 has no flexbox: for each row-flex container element found in the
-    HTML, make its direct block-level children inline-block so they line up
-    horizontally (fixed-width sidebars keep their CSS width; flexible columns
-    shrink to their content)."""
+def _fixed_px_widths(css):
+    """class name -> fixed pixel width (40..600px) from simple class rules."""
+    widths = {}
+    for rm in re.finditer(r"([^{}]+)\{([^{}]*)\}", css):
+        sel, body = rm.group(1), rm.group(2)
+        wm = re.search(r"(?<![-\w])width\s*:\s*(\d+)px", body, re.I)
+        if not wm:
+            continue
+        w = int(wm.group(1))
+        if not 40 <= w <= 600:
+            continue
+        for cm in re.finditer(r"\.([A-Za-z_][\w-]*)", sel):
+            widths.setdefault(cm.group(1), w)
+    return widths
+
+
+def _flex_row_layout(html, flex_classes, widths):
+    """IE6 has no flexbox. For each row-flex container element found in the
+    HTML: children with a known fixed pixel width (e.g. a 225px sidebar) get
+    float:left; their siblings get overflow:hidden so they wrap around the
+    float and take the remaining width -- the classic pre-flex two-column
+    pattern, which is rock solid in IE6. If no child has a known width, fall
+    back to making all of them inline-block."""
     if not flex_classes:
         return html
-    edits = []  # (open_start, open_end) of child tags to modify
+    edits = []  # (open_start, open_end, css-to-append)
     for m in re.finditer(r"<([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)>", html):
         attrs = m.group(2) or ""
         cm = re.search(r'class\s*=\s*["\']([^"\']*)["\']', attrs, re.I)
@@ -700,6 +718,7 @@ def _flex_row_inline(html, flex_classes):
             continue
         if not (set(cm.group(1).split()) & flex_classes):
             continue
+        children = []  # (start, end, classes-set, has-inline-display)
         depth = 1
         start = m.end()
         for tm in re.finditer(r"</?([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)?>", html[start:]):
@@ -712,23 +731,43 @@ def _flex_row_inline(html, flex_classes):
             if tag in _VOID_TAGS or tattrs.rstrip().endswith("/"):
                 continue
             if depth == 1 and tag in _FLEX_ROW_CHILD_TAGS:
+                ccm = re.search(r'class\s*=\s*["\']([^"\']*)["\']', tattrs, re.I)
                 sm = re.search(r'style\s*=\s*["\']([^"\']*)["\']', tattrs, re.I)
-                if not (sm and re.search(r"display", sm.group(1), re.I)):
-                    edits.append((start + tm.start(), start + tm.end()))
+                children.append((
+                    start + tm.start(),
+                    start + tm.end(),
+                    set(ccm.group(1).split()) if ccm else set(),
+                    bool(sm and re.search(r"display", sm.group(1), re.I)),
+                ))
             depth += 1
-    for open_start, open_end in sorted(edits, reverse=True):
+        if not children:
+            continue
+        has_floated = any(
+            (not cd) and any(k in widths for k in cclasses)
+            for _, _, cclasses, cd in children
+        )
+        for cs, ce, cclasses, cd in children:
+            if cd:  # keep explicit inline display untouched
+                continue
+            if has_floated and any(k in widths for k in cclasses):
+                add = "float:left;"
+            elif has_floated:
+                add = "overflow:hidden;"
+            else:
+                add = "display:inline-block;vertical-align:top;"
+            edits.append((cs, ce, add))
+    for open_start, open_end, add in sorted(edits, reverse=True):
         tag_text = html[open_start:open_end]
         if re.search(r"\bstyle\s*=\s*[\"']", tag_text, re.I):
             tag_text = re.sub(
                 r"(\bstyle\s*=\s*[\"'])([^\"']*)",
-                lambda mm: mm.group(1) + mm.group(2)
-                + "display:inline-block;vertical-align:top;",
+                lambda mm: mm.group(1) + mm.group(2) + add,
                 tag_text,
                 count=1,
                 flags=re.I,
             )
         else:
-            tag_text = tag_text[:-1] + ' style="display:inline-block;vertical-align:top">'
+            tag_text = tag_text[:-1] + ' style="%s">' % add
         html = html[:open_start] + tag_text + html[open_end:]
     return html
 
@@ -955,9 +994,11 @@ class Handler(BaseHTTPRequestHandler):
             # Find row-flex containers (from <style> blocks and linked
             # stylesheets) so their children can be laid out side by side.
             flex_classes = set()
+            widths = {}
             for sm in re.finditer(r"<style\b[^>]*>(.*?)</style\s*>",
                                   text, re.I | re.S):
                 flex_classes |= _flex_container_classes(sm.group(1))
+                widths.update(_fixed_px_widths(sm.group(1)))
             for lm in re.finditer(r"<link\b[^>]*>", text, re.I):
                 tag = lm.group(0)
                 if not re.search(r'rel\s*=\s*["\']?stylesheet', tag, re.I):
@@ -971,10 +1012,11 @@ class Handler(BaseHTTPRequestHandler):
                     continue
                 _, _, sdata = http_get(su, timeout=5)
                 if sdata:
-                    flex_classes |= _flex_container_classes(
-                        sdata.decode("utf-8", "replace"))
+                    scss = sdata.decode("utf-8", "replace")
+                    flex_classes |= _flex_container_classes(scss)
+                    widths.update(_fixed_px_widths(scss))
             text = transform_html(text, url, abs_base)
-            text = _flex_row_inline(text, flex_classes)
+            text = _flex_row_layout(text, flex_classes, widths)
             self._send(text, "text/html", 200, head_only)
             return
         if ctype == "text/css":
