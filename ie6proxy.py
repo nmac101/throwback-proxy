@@ -1021,8 +1021,13 @@ def _flex_container_classes(css):
             continue
         if re.search(r"flex-direction\s*:\s*column", body, re.I):
             continue
-        for cm in re.finditer(r"\.([A-Za-z_][\w-]*)", sel):
-            classes.add(cm.group(1))
+        # Only the last class in each selector part is the flex container;
+        # earlier classes are ancestor components (e.g. ".mw-header
+        # .vector-header-end" is the end row, not .mw-header).
+        for part in sel.split(","):
+            cm = list(re.finditer(r"\.([A-Za-z_][\w-]*)", part))
+            if cm:
+                classes.add(cm[-1].group(1))
     return classes
 
 
@@ -1084,6 +1089,47 @@ def _pinned_classes(css):
     return pinned
 
 
+def _flex_sibling_floats(html, flex_classes):
+    """Float flex containers that are siblings of other flex containers.
+    Handles the common 'row of sub-rows' pattern (e.g. a header with a left
+    group and a right group, each a flex row) where the parent is a plain
+    block and the sub-rows would otherwise stack vertically.  Only applies
+    when the parent itself is not a flex container (that case is handled by
+    _flex_row_layout's child pass)."""
+    if not flex_classes:
+        return []
+    els = []  # {start, end, flex, parent}
+    open_stack = []  # (tag, index_in_els)
+    for m in re.finditer(r"</?([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)>", html):
+        closing, tag, attrs = m.group(0)[1] == "/", m.group(1).lower(), m.group(2) or ""
+        if closing:
+            if open_stack and open_stack[-1][0] == tag:
+                open_stack.pop()
+            continue
+        if tag in _VOID_TAGS or attrs.rstrip().endswith("/"):
+            continue
+        parent = open_stack[-1][1] if open_stack else -1
+        cm = re.search(r'class\s*=\s*["\']([^"\']*)["\']', attrs, re.I)
+        cls = set(cm.group(1).split()) if cm else set()
+        idx = len(els)
+        els.append({"start": m.start(), "end": m.end(),
+                    "flex": bool(cls & flex_classes), "parent": parent})
+        open_stack.append((tag, idx))
+    by_parent = {}
+    for e in els:
+        by_parent.setdefault(e["parent"], []).append(e)
+    edits = []
+    for parent, kids in by_parent.items():
+        flex_kids = [k for k in kids if k["flex"]]
+        if len(flex_kids) >= 2 and (parent < 0 or not els[parent]["flex"]):
+            for k in flex_kids:
+                edits.append((k["start"], k["end"], "float:left;"))
+            if parent >= 0:
+                edits.append((els[parent]["start"], els[parent]["end"],
+                              "overflow:hidden;"))
+    return edits
+
+
 def _flex_row_layout(html, flex_classes, widths, pinned=None):
     """IE6 has no flexbox. For each row-flex container element found in the
     HTML: children with a known fixed pixel width (e.g. a fixed-width sidebar)
@@ -1139,6 +1185,7 @@ def _flex_row_layout(html, flex_classes, widths, pinned=None):
              if not cd for k in ccs if k in pinned and k in widths),
             None,
         )
+        all_float = not has_floated and pinned_w is None
         for cs, ce, cclasses, cd in children:
             if cd:  # keep explicit inline display untouched
                 continue
@@ -1151,8 +1198,23 @@ def _flex_row_layout(html, flex_classes, widths, pinned=None):
             elif has_floated:
                 add = "overflow:hidden;"
             else:
-                add = "display:inline;vertical-align:top;"
+                # No child has a known width: float them left so the row's
+                # block-level items flow horizontally (display:inline would
+                # leave them stacked, since their content is block-level).
+                add = "float:left;"
             edits.append((cs, ce, add))
+        if all_float:
+            # clearfix on the container so it wraps the floated children
+            edits.append((m.start(), m.end(), "overflow:hidden;"))
+    edits.extend(_flex_sibling_floats(html, flex_classes))
+    # Merge edits that target the same element (e.g. a flex container that is
+    # itself a floated child of another flex container) so we don't emit two
+    # style="" attributes.
+    merged = {}
+    for open_start, open_end, add in edits:
+        key = (open_start, open_end)
+        merged[key] = merged.get(key, "") + add
+    edits = [(s, e, st) for (s, e), st in merged.items()]
     for open_start, open_end, add in sorted(edits, reverse=True):
         tag_text = html[open_start:open_end]
         if re.search(r"\bstyle\s*=\s*[\"']", tag_text, re.I):
