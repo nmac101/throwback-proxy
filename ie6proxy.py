@@ -480,6 +480,40 @@ ATTR_RE = re.compile(
     r"""([\w:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))"""
 )
 
+# Tiny ES5 shims so common modern inline scripts at least parse and degrade
+# gracefully in IE6 (which lacks console, querySelector, Audio, addEventListener,
+# Array.prototype.forEach, ...). Injected right after <head>.
+IE6_SHIM = (
+    "<script>"
+    "if(!window.console){window.console={log:function(){},warn:function(){},"
+    "error:function(){}};}"
+    "if(!Array.prototype.forEach){Array.prototype.forEach=function(f){for("
+    "var i=0;i<this.length;i++){f(this[i],i,this);}};}"
+    "if(!document.querySelector){document.querySelector=function(){return null;};}"
+    "if(!document.querySelectorAll){document.querySelectorAll=function(){return[];};}"
+    "if(!window.Audio){window.Audio=function(){return{play:function(){},pause:"
+    "function(){},currentTime:0};};}"
+    "if(!document.addEventListener){document.addEventListener=function(t,f){var "
+    "d=document;if(t==='DOMContentLoaded'){if(d.readyState!=='loading'){f();}"
+    "else{d.attachEvent('onreadystatechange',function(){if(d.readyState!="
+    "'loading'){f();}});}}else{d.attachEvent('on'+t,f);}};}"
+    "if(!window.addEventListener){window.addEventListener=function(t,f){window."
+    "attachEvent('on'+t,f);};}"
+    "</script>"
+)
+
+
+def _downgrade_js(src):
+    """Light ES6->ES5 pass for inline scripts: const/let -> var and block-body
+    arrow functions -> function expressions. Deeper syntax (template literals,
+    class, async) is left alone; if it remains the script simply fails in IE6."""
+    s = re.sub(r"\b(const|let)\s+", "var ", src)
+    # block-body arrows: "(a, b) => {" -> "function(a, b){"
+    s = re.sub(r"(\([^()]*\))\s*=>\s*\{", r"function\1{", s)
+    # bare-identifier arrows: "x => {" -> "function(x){"
+    s = re.sub(r"([A-Za-z_$][\w$]*)\s*=>\s*\{", r"function(\1){", s)
+    return s
+
 SKIP_URL_PREFIXES = ("data:", "#", "javascript:", "mailto:", "tel:", "about:")
 
 
@@ -512,10 +546,24 @@ def transform_html(html, base, abs_base=None):
     if bm:
         base = urljoin(base, bm.group(1))
 
-    # Drop ES modules and ad scripts; strip defer/async from the rest.
+    # Drop ES modules and ad scripts; strip defer/async from the rest;
+    # down-grade inline script syntax to ES5.
     html = re.sub(
         r"<script[^>]*type\s*=\s*['\"]?module['\"]?[^>]*>.*?</script\s*>",
         "",
+        html,
+        flags=re.I | re.S,
+    )
+
+    def _inline_script(m):
+        open_tag, body = m.group(1), m.group(2)
+        if re.search(r"\bsrc\s*=", open_tag, re.I):
+            return m.group(0)
+        return open_tag + _downgrade_js(body) + "</script>"
+
+    html = re.sub(
+        r"(<script\b[^>]*>)(.*?)</script\s*>",
+        _inline_script,
         html,
         flags=re.I | re.S,
     )
@@ -577,6 +625,15 @@ def transform_html(html, base, abs_base=None):
         elif re.search(r"<html[^>]*>", html, re.I):
             html = re.sub(r"(<html[^>]*>)", r"\1" + ins, html, count=1, flags=re.I)
 
+    # ES5 compatibility shims, before any page script can run.
+    if re.search(r"<head[^>]*>", html, re.I):
+        html = re.sub(
+            r"(<head[^>]*>)", lambda m: m.group(1) + IE6_SHIM,
+            html,
+            count=1,
+            flags=re.I,
+        )
+
     # Rewrite every tag's URL-bearing attributes through the proxy.
     html = re.sub(
         r"<[a-zA-Z][^>]*>",
@@ -624,13 +681,9 @@ LANDING = """<!DOCTYPE html>
 <body bgcolor="#ffffff" text="#000000">
 <center>
 <h1>Internet Explorer 6 Proxy</h1>
-<p>Enter a URL to browse it through the IE6-ifying proxy:</p>
-<form onsubmit="if(this.u.value){var v=this.u.value;
-if(v.indexOf('http')!==0){v='http://'+v;}
-location.href='/'+v;}return false;">
-<input type="text" name="u" size="50" value="example.com">
-<input type="submit" value="Go">
-</form>
+<p>This proxy only works when configured as your <b>system / LAN proxy</b>.</p>
+<p>Set your browser's proxy to <tt>__ADDR__</tt> (Internet Options &rarr;
+Connections &rarr; LAN settings &rarr; Proxy) and then browse normally.</p>
 <p style="font-size:11px;color:#666666">
 All pages are rewritten for IE6 (HTML4, no CSS3, no flexbox), HTTPS is
 downgraded to HTTP, and ads are blocked.
@@ -754,15 +807,31 @@ class Handler(BaseHTTPRequestHandler):
             )
             abs_base = self._abs_base()
         else:
+            # Direct URLs (http://proxy:port/http://host/...) are not a thing;
+            # this proxy is only meant to be used as a system/LAN proxy.
             path = urlparse(self.path).path
             if path in ("/", "/index.html"):
-                self._send(LANDING, "text/html", head_only=head_only)
+                self._send(
+                    LANDING.replace(
+                        "__ADDR__",
+                        "%s:%d" % (
+                            self.client_address[0],
+                            self.server.server_address[1],
+                        ),
+                    ),
+                    "text/html",
+                    head_only=head_only,
+                )
                 return
-            url = from_proxy(path)
-            if not url:
-                self._send("<html><body>Not found</body></html>", "text/html",
-                           404, head_only)
-                return
+            self._send(
+                "<html><body>Not found.<br>This proxy is only used via "
+                "system/LAN proxy settings, not by typing proxy URLs.</body>"
+                "</html>",
+                "text/html",
+                404,
+                head_only,
+            )
+            return
 
         # --- ad blocking (no upstream request at all) ---
         if _is_ad_url(url):
@@ -833,8 +902,7 @@ def main():
     srv = ThreadingHTTPServer((HOST, port), Handler)
     srv.ssl_ctx = _make_tls_context()
     print("IE6 proxy listening on http://%s:%d/" % (HOST, port))
-    print("Try:  http://%s:%d/http://example.com/" % (HOST, port))
-    print("Or set it as your LAN/system proxy: %s:%d" % (HOST, port))
+    print("Set it as your system/LAN proxy: <this machine's IP>:%d" % port)
     if srv.ssl_ctx is None:
         print(
             "Note: openssl not found -- CONNECT (HTTPS sites in "

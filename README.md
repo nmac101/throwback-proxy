@@ -10,15 +10,11 @@ page structure — and blocks ads on the way.
 python3 ie6proxy.py [port]     # default: 8080
 ```
 
-Then browse to `http://127.0.0.1:8080/` (landing page with a URL box), or
-directly to the target URL as a path, e.g.
-`http://127.0.0.1:8080/http://example.com/`.
-
-Proxy URL scheme: `/<scheme>/<host[:port]>/<path>?<query>` — the legacy
-`/p/<scheme>/...` prefix and absolute-form requests (`GET http://example.com/`)
-are accepted as well.
-
 ## Use it as your system / LAN proxy
+
+This is the only way to use the proxy: there are no direct URLs like
+`http://proxy:8080/http://example.com/` — point your browser at the machine
+running the proxy and browse normally.
 
 The proxy listens on `0.0.0.0`, so it is reachable from other machines on
 your network too. Set the HTTP proxy in your browser/OS internet settings to
