@@ -7,16 +7,11 @@ blocks ads along the way.
 Usage:
     python3 ie6proxy.py [port]          (default port: 8080)
 
-Then point IE6 at:
-    http://127.0.0.1:8080/              (landing page with a URL box)
-or browse directly to the target URL as a path:
-    http://127.0.0.1:8080/http://example.com/page.html
-(the legacy /p/http/... form and absolute-form "GET http://..." requests
-are accepted too)
-
-It can also be set as the system/LAN proxy (127.0.0.1:8080): absolute-form
-requests are proxied directly, and CONNECT tunnels for HTTPS sites are
-terminated with a self-signed certificate and downgraded to HTTP upstream.
+Then set it as your system/LAN proxy (this machine's IP, port 8080).
+Absolute-form requests are proxied directly, and CONNECT tunnels for
+HTTPS sites are terminated with a self-signed certificate and downgraded
+to HTTP upstream. There are no direct proxy URLs -- the browser must use
+it as its configured proxy.
 
 How it works:
   * Every response is fetched upstream and, depending on its type:
@@ -26,8 +21,9 @@ How it works:
                     src/href/poster/style-url() is rewritten to go through
                     this proxy.
       - text/css  : @media/@supports/@font-face/keyframes are removed,
-                    flexbox/grid become block/inline, position:fixed becomes
-                    absolute, gradients collapse to a solid color,
+                    flexbox rows are approximated with inline-block children,
+                    position:fixed becomes absolute + CSS expressions,
+                    gradients/shadows/opacity become DXImageTransform filters,
                     rgba()/hsl() become rgb(), calc()/vw/vh are approximated,
                     unsupported properties and selectors are dropped, and
                     url() references are rewritten through the proxy.
@@ -42,6 +38,7 @@ the openssl CLI is optional (enables CONNECT/TLS for system-proxy mode).
 """
 
 import colorsys
+from html import unescape as html_unescape
 import io
 import os
 import re
@@ -646,6 +643,96 @@ def transform_html(html, base, abs_base=None):
 # ---------------------------------------------------------------------------
 # HTTP handler
 # ---------------------------------------------------------------------------
+def http_get(url, timeout=10):
+    """GET a URL; returns (status, headers-dict, body-bytes) or (None, None, None)."""
+    req = Request(
+        url,
+        headers={
+            "User-Agent": UPSTREAM_UA,
+            "Accept": "*/*",
+            "Accept-Encoding": "identity",
+        },
+    )
+    try:
+        resp = urlopen(req, timeout=timeout)
+    except HTTPError as e:
+        return e.code, dict(e.headers.items() or []), e.read()
+    except Exception:
+        return None, None, None
+    return resp.status, dict(resp.headers.items()), resp.read()
+
+
+def _flex_container_classes(css):
+    """Class names of row-direction flex containers (the ones that lay their
+    children out side by side). Column flex degrades fine to plain block."""
+    classes = set()
+    for rm in re.finditer(r"([^{}]+)\{([^{}]*)\}", css):
+        sel, body = rm.group(1), rm.group(2)
+        if not re.search(r"display\s*:\s*(?:inline-)?flex\b", body, re.I):
+            continue
+        if re.search(r"flex-direction\s*:\s*column", body, re.I):
+            continue
+        for cm in re.finditer(r"\.([A-Za-z_][\w-]*)", sel):
+            classes.add(cm.group(1))
+    return classes
+
+
+_FLEX_ROW_CHILD_TAGS = set(
+    "div section article aside nav main header footer ul ol table form fieldset".split()
+)
+_VOID_TAGS = set(
+    "area base br col embed hr img input link meta param source track wbr".split()
+)
+
+
+def _flex_row_inline(html, flex_classes):
+    """IE6 has no flexbox: for each row-flex container element found in the
+    HTML, make its direct block-level children inline-block so they line up
+    horizontally (fixed-width sidebars keep their CSS width; flexible columns
+    shrink to their content)."""
+    if not flex_classes:
+        return html
+    edits = []  # (open_start, open_end) of child tags to modify
+    for m in re.finditer(r"<([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)>", html):
+        attrs = m.group(2) or ""
+        cm = re.search(r'class\s*=\s*["\']([^"\']*)["\']', attrs, re.I)
+        if not cm:
+            continue
+        if not (set(cm.group(1).split()) & flex_classes):
+            continue
+        depth = 1
+        start = m.end()
+        for tm in re.finditer(r"</?([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)?>", html[start:]):
+            tag, tattrs = tm.group(1).lower(), tm.group(2) or ""
+            if tm.group(0)[1] == "/":  # closing tag
+                depth -= 1
+                if depth == 0:
+                    break
+                continue
+            if tag in _VOID_TAGS or tattrs.rstrip().endswith("/"):
+                continue
+            if depth == 1 and tag in _FLEX_ROW_CHILD_TAGS:
+                sm = re.search(r'style\s*=\s*["\']([^"\']*)["\']', tattrs, re.I)
+                if not (sm and re.search(r"display", sm.group(1), re.I)):
+                    edits.append((start + tm.start(), start + tm.end()))
+            depth += 1
+    for open_start, open_end in sorted(edits, reverse=True):
+        tag_text = html[open_start:open_end]
+        if re.search(r"\bstyle\s*=\s*[\"']", tag_text, re.I):
+            tag_text = re.sub(
+                r"(\bstyle\s*=\s*[\"'])([^\"']*)",
+                lambda mm: mm.group(1) + mm.group(2)
+                + "display:inline-block;vertical-align:top;",
+                tag_text,
+                count=1,
+                flags=re.I,
+            )
+        else:
+            tag_text = tag_text[:-1] + ' style="display:inline-block;vertical-align:top">'
+        html = html[:open_start] + tag_text + html[open_end:]
+    return html
+
+
 def _make_tls_context():
     """Self-signed cert via the openssl CLI, cached in a temp dir."""
     d = os.path.join(tempfile.gettempdir(), "ie6proxy-tls")
@@ -847,42 +934,47 @@ class Handler(BaseHTTPRequestHandler):
         url = re.sub(r"^https://", "http://", url)
 
         # --- fetch upstream ---
-        req = Request(
-            url,
-            headers={
-                "User-Agent": UPSTREAM_UA,
-                "Accept": "*/*",
-                "Accept-Encoding": "identity",
-            },
-        )
-        try:
-            resp = urlopen(req, timeout=20)
-        except HTTPError as e:
-            body = e.read()
-            if 300 <= e.code < 400 and e.headers.get("Location"):
-                loc = urljoin(url, e.headers["Location"])
-                self._redirect(to_proxy(loc, abs_base))
-                return
-            self._send(body, e.headers.get_content_type() or "text/plain",
-                       e.code, head_only)
-            return
-        except (URLError, OSError) as e:
+        status, headers, body = http_get(url, timeout=20)
+        if status is None:
             self._send(
-                "<html><body>Upstream error: %s</body></html>" % e,
-                "text/html", 502, head_only,
+                b"Upstream error: could not reach " + url.encode("utf-8", "replace"),
+                "text/plain", 502, head_only,
             )
             return
-
-        body = resp.read()
-        ctype = (resp.headers.get_content_type() or "application/octet-stream")
-        charset_m = re.search(r"charset=([\w-]+)",
-                              resp.headers.get("Content-Type") or "", re.I)
+        if 300 <= status < 400 and headers.get("Location"):
+            loc = urljoin(url, headers["Location"])
+            self._redirect(to_proxy(loc, abs_base))
+            return
+        ctype = headers.get("Content-Type", "application/octet-stream").split(";")[0].strip()
+        charset_m = re.search(r"charset=([\w-]+)", headers.get("Content-Type") or "", re.I)
         charset = charset_m.group(1).lower() if charset_m else "utf-8"
 
         # --- transform by type ---
         if ctype == "text/html":
             text = body.decode(charset, errors="replace")
+            # Find row-flex containers (from <style> blocks and linked
+            # stylesheets) so their children can be laid out side by side.
+            flex_classes = set()
+            for sm in re.finditer(r"<style\b[^>]*>(.*?)</style\s*>",
+                                  text, re.I | re.S):
+                flex_classes |= _flex_container_classes(sm.group(1))
+            for lm in re.finditer(r"<link\b[^>]*>", text, re.I):
+                tag = lm.group(0)
+                if not re.search(r'rel\s*=\s*["\']?stylesheet', tag, re.I):
+                    continue
+                hm = re.search(r'href\s*=\s*["\']([^"\']+)["\']', tag, re.I)
+                if not hm:
+                    continue
+                su = re.sub(r"^https://", "http://",
+                            urljoin(url, html_unescape(hm.group(1))))
+                if _is_ad_url(su):
+                    continue
+                _, _, sdata = http_get(su, timeout=5)
+                if sdata:
+                    flex_classes |= _flex_container_classes(
+                        sdata.decode("utf-8", "replace"))
             text = transform_html(text, url, abs_base)
+            text = _flex_row_inline(text, flex_classes)
             self._send(text, "text/html", 200, head_only)
             return
         if ctype == "text/css":

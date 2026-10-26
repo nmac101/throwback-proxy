@@ -47,6 +47,7 @@ Without `openssl`, `http://` sites still work but `https://` ones fail.
 ### CSS (text/css and inline styles)
 - `@media`, `@supports`, `@font-face`, `@keyframes` blocks removed.
 - `display: flex/grid` → `block`/`inline`; flexbox/grid properties dropped. A flex container with `justify-content: center` also gets `text-align: center` so inline content stays centered.
+- **Row flex layouts (sidebars!)**: when serving a page, its `<style>` blocks and linked stylesheets are fetched; elements that are row-direction flex containers get their direct block-level children set to `display:inline-block;vertical-align:top`, so a fixed-width sidebar sits left of the main column instead of stacking on top. Column flex (e.g. the sidebar's own contents) degrades to plain block.
 - `position: fixed` → the classic IE6 CSS-expression hack (`absolute` + `scrollLeft`/`scrollTop` expressions), preserving the element's top/left offset. (Offsets given via `bottom`/`right` are not preserved.)
 - **Modern effects are approximated with IE6's DXImageTransform filters** rather than just dropped:
   - `linear-gradient()` / `radial-gradient()` → `DXImageTransform.Microsoft.Gradient` (end colors + nearest cardinal direction), with the first stop kept as a solid `background-color` fallback.
