@@ -30,12 +30,15 @@ How it works:
                     unsupported properties and selectors are dropped, and
                     url() references are rewritten through the proxy.
       - image/webp: converted to PNG on the fly (if Pillow is installed).
+      - image/svg+xml: converted to PNG on the fly (if ImageMagick is
+        installed); IE6 cannot render SVG.
   * All upstream HTTPS requests are transparently downgraded to HTTP.
   * Requests whose host matches a known ad/tracking domain are served an
     empty response (204) or a transparent 1x1 GIF, without touching the
     network at all.
 
-Only the Python standard library is required. Pillow is optional (webp);
+Only the Python standard library is required. Pillow is optional (webp),
+ImageMagick optional (svg);
 the openssl CLI is optional (enables CONNECT/TLS for system-proxy mode).
 """
 
@@ -44,6 +47,7 @@ from html import unescape as html_unescape
 import io
 import os
 import re
+import shutil
 import ssl
 import subprocess
 import sys
@@ -63,6 +67,28 @@ try:  # optional: webp -> png conversion
         return buf.getvalue()
 except ImportError:  # pragma: no cover
     _webp_to_png = None
+
+
+_IM = next((shutil.which(t) for t in ("magick", "convert") if shutil.which(t)),
+           None)
+
+
+def _svg_to_png(data):
+    """SVG -> PNG via ImageMagick (optional).  IE6 cannot render SVG; the
+    image is rendered at its intrinsic size and scaled by the page's own
+    <img>/CSS sizing."""
+    if not _IM:
+        return None
+    try:
+        r = subprocess.run(
+            [_IM, "-background", "transparent", "svg:-", "png:-"],
+            input=data, capture_output=True, timeout=15,
+        )
+        if r.returncode == 0 and r.stdout:
+            return r.stdout
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
 
 try:
     from http.server import ThreadingHTTPServer  # py>=3.7
@@ -1258,14 +1284,16 @@ def _viewport_elements(html, vp):
 
 
 def _bg_image_classes(css):
-    """Class -> (url, 'cover'|'contain') for rules with a background image
-    AND background-size.  IE6 can't scale background images (and a
-    width:100%-ish div with no height collapses to nothing), so the HTML
-    step replaces the image with a nested <img> that scales like cover."""
+    """Class -> (url, size) for rules with a background image AND
+    background-size (cover/contain/100%).  IE6 can't scale background
+    images (and a width:100%-ish div with no height collapses to nothing),
+    so the HTML step replaces the image with a nested <img> that scales
+    like the requested size."""
     out = {}
     for rm in re.finditer(r"([^{}]+)\{([^{}]*)\}", css):
         body = rm.group(2)
-        sm = re.search(r"background-size\s*:\s*(cover|contain)", body, re.I)
+        sm = re.search(
+            r"background-size\s*:\s*(cover|contain|100%)", body, re.I)
         if not sm:
             continue
         bm = re.search(
@@ -1274,11 +1302,14 @@ def _bg_image_classes(css):
         )
         if not bm:
             continue
-        # only the LAST class of the selector (most specific) -- mapping
+        # only the LAST class/id of the selector (most specific) -- mapping
         # ancestor classes too would inject the img into their elements
         cls = re.findall(r"\.([A-Za-z_][\w-]*)", rm.group(1))
         if cls:
             out[cls[-1]] = (bm.group(2), sm.group(1).lower())
+        ids = re.findall(r"#([A-Za-z_][\w-]*)", rm.group(1))
+        if ids:
+            out["#" + ids[-1]] = (bm.group(2), sm.group(1).lower())
     return out
 
 
@@ -1295,14 +1326,17 @@ def _bg_image_elements(html, bg, base, abs_base=None):
         if tag in _VOID_TAGS or tag == "img":
             continue
         attrs = m.group(2) or ""
-        cm = re.search(r'class\s*=\s*["\']([^"\']*)["\']', attrs, re.I)
-        if not cm:
-            continue
         hit = None
-        for cls in set(cm.group(1).split()):
-            if cls in bg:
-                hit = bg[cls]
-                break
+        idm = re.search(r'id\s*=\s*["\']([^"\']*)["\']', attrs, re.I)
+        if idm and ("#" + idm.group(1)) in bg:
+            hit = bg["#" + idm.group(1)]
+        if not hit:
+            cm = re.search(r'class\s*=\s*["\']([^"\']*)["\']', attrs, re.I)
+            if cm:
+                for cls in set(cm.group(1).split()):
+                    if cls in bg:
+                        hit = bg[cls]
+                        break
         if not hit:
             continue
         raw_url, _size = hit
@@ -1688,7 +1722,10 @@ class Handler(BaseHTTPRequestHandler):
                 pinned |= _pinned_classes(sm.group(1))
                 for k, v in _viewport_classes(sm.group(1)).items():
                     vp.setdefault(k, []).extend(v)
-                bg.update(_bg_image_classes(sm.group(1)))
+                # on the TRANSFORMED css: the image url may live in a
+                # var() that only flattening/resolution exposes
+                bg.update(_bg_image_classes(
+                    transform_css(sm.group(1), url, abs_base)))
                 bottom |= _margin_auto_classes(sm.group(1))
                 body_filter = body_filter or _body_gradient_filter(sm.group(1))
             for lm in re.finditer(r"<link\b[^>]*>", text, re.I):
@@ -1711,7 +1748,8 @@ class Handler(BaseHTTPRequestHandler):
                     pinned |= _pinned_classes(scss)
                     for k, v in _viewport_classes(scss).items():
                         vp.setdefault(k, []).extend(v)
-                    bg.update(_bg_image_classes(scss))
+                    bg.update(_bg_image_classes(
+                        transform_css(scss, su, abs_base)))
                     bottom |= _margin_auto_classes(scss)
                     body_filter = body_filter or _body_gradient_filter(scss)
             text = transform_html(text, url, abs_base)
@@ -1759,6 +1797,11 @@ class Handler(BaseHTTPRequestHandler):
         if ctype == "image/webp" and _webp_to_png:
             body = _webp_to_png(body)
             ctype = "image/png"
+        if (ctype == "image/svg+xml" or url.lower().endswith(".svg")) \
+                and _svg_to_png:
+            png = _svg_to_png(body)
+            if png:
+                body, ctype = png, "image/png"
 
         self._send(body, ctype, 200, head_only)
 

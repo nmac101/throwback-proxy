@@ -52,7 +52,7 @@ Without `openssl`, `http://` sites still work but `https://` ones fail.
 - `margin-top: auto` inside a pinned full-height container (the flexbox "push to bottom" idiom) → `position:absolute` with the container's padding/width, so the block keeps its in-flow geometry (inset by the padding, same content width) anchored to the container's bottom.
 - **Modern effects are approximated with IE6's DXImageTransform filters** rather than just dropped:
   - `linear-gradient()` / `radial-gradient()` → `DXImageTransform.Microsoft.Gradient` (end colors + nearest cardinal direction; `radial-gradient(... at <pos>)` points away from `<pos>`), with the first stop kept as a solid `background-color` fallback. Multi-layer backgrounds (gradient over `url(...)`) keep the image as `background-image`, with the gradient painted over it as the filter.
-  - Elements with `background(-image)` + `background-size: cover|contain` get the image replaced by a nested `<img style="width:100%">` (IE6 can't scale background images, and such divs usually have no height of their own); the element's own `background-image` is suppressed inline.
+  - Elements with `background(-image)` + `background-size: cover|contain|100%` get the image replaced by a nested `<img style="width:100%">` (IE6 can't scale background images, and such divs usually have no height of their own); the element's own `background-image` is suppressed inline. The mapping works off the *transformed* CSS (so image urls hidden in `var()` are found) and matches ID selectors as well as classes.
   - `rgba()` alpha is preserved for the filters (as 8-digit `#AARRGGBB`); in plain CSS properties the 4-value `rgb()` form is left for IE6 to ignore.
   - `box-shadow` / `text-shadow` → `DXImageTransform.Microsoft.DropShadow` (first shadow only; `inset` dropped).
   - All filter colors are emitted as 8-digit `#AARRGGBB` — the DXImageTransform filters silently fail on 6-digit `#RRGGBB`.
@@ -70,6 +70,7 @@ Without `openssl`, `http://` sites still work but `https://` ones fail.
 
 ### Images
 - `image/webp` is converted to PNG on the fly **if Pillow is installed** (`pip install pillow`); otherwise it passes through unchanged.
+- `image/svg+xml` is converted to PNG on the fly **if ImageMagick is installed** (`magick`/`convert`); IE6 cannot render SVG, otherwise it passes through unchanged.
 
 ### HTTPS downgrade
 All upstream fetches use plain HTTP: a `/https/host/...` link is fetched from `http://host/...`. (Links in rewritten pages still carry their original scheme, so mixed content behaves as it would on the open web.)
