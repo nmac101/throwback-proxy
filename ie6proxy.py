@@ -427,6 +427,11 @@ def _transform_decls(body):
             v = "inline" if "inline" in v else "block"
             if center and v == "block":
                 decls.append("text-align: center")
+        elif p == "display" and v == "inline-block":
+            # IE6 has no inline-block; inline is the closest degradation
+            # (this is what makes font-size:0 + inline-block nav menus lay
+            # out horizontally instead of stacking as block list-items).
+            v = "inline"
         elif p == "position" and v.lower() in ("fixed", "sticky"):
             v = "absolute"
             fixed = True
@@ -1063,7 +1068,7 @@ def _flex_row_layout(html, flex_classes, widths, pinned=None):
             elif has_floated:
                 add = "overflow:hidden;"
             else:
-                add = "display:inline-block;vertical-align:top;"
+                add = "display:inline;vertical-align:top;"
             edits.append((cs, ce, add))
     for open_start, open_end, add in sorted(edits, reverse=True):
         tag_text = html[open_start:open_end]
