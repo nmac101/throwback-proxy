@@ -236,11 +236,17 @@ def _to_hex(color):
     c = color.strip().lower()
     if c in _NAMED_COLORS:
         return _NAMED_COLORS[c]
-    m = re.match(r"rgb\((\d+),\s*(\d+),\s*(\d+)\)$", c)
+    m = re.match(r"rgba?\(\s*(\d+),\s*(\d+),\s*(\d+)\s*(?:[,/]\s*[\d.]+%?)?\s*\)$", c)
     if m:
-        return "#%02x%02x%02x" % tuple(int(x) for x in m.groups())
+        return "#%02x%02x%02x" % tuple(min(255, int(x)) for x in m.groups())
+    m = re.fullmatch(r"#([0-9a-f]{6})[0-9a-f]{2}", c)  # #rrggbbaa -> drop alpha
+    if m:
+        return "#" + m.group(1)
     if re.fullmatch(r"#[0-9a-f]{6}", c):
         return c
+    m = re.fullmatch(r"#([0-9a-f]{3})[0-9a-f]", c)  # #rgba -> drop alpha
+    if m:
+        return "#" + "".join(ch * 2 for ch in m.group(1))
     if re.fullmatch(r"#[0-9a-f]{3}", c):
         return "#" + "".join(ch * 2 for ch in c[1:])
     return None
@@ -251,7 +257,7 @@ def _px(value):
     return float(m.group(1)) if m else 0.0
 
 
-_COLOR_RE = r"(#[0-9a-fA-F]{3,8}\b|rgb\([^)]*\)|%s\b)" % "|".join(_NAMED_COLORS)
+_COLOR_RE = r"(#[0-9a-fA-F]{3,8}\b|rgba?\([^)]*\)|%s\b)" % "|".join(_NAMED_COLORS)
 
 
 def _gradient_filter(value):
@@ -260,9 +266,13 @@ def _gradient_filter(value):
     Returns (filter_value, first_color) or None. Only the two end colors and
     the nearest of the four cardinal directions can be represented.
     """
-    m = re.search(r"(?:linear|radial)-gradient\(", value)
-    if not m:
+    matches = list(re.finditer(r"(?:linear|radial)-gradient\(", value))
+    if not matches:
         return None
+    # With multiple comma-separated background layers, CSS paints the first
+    # listed one on top.  We can only emit one filter, so use the LAST
+    # gradient (the opaque base layer) and ignore translucent overlays.
+    m = matches[-1]
     i = value.index("(", m.start())
     j = _balanced_paren(value, i)
     inner = value[i + 1 : j]
@@ -271,15 +281,26 @@ def _gradient_filter(value):
         return None
     first, last = colors[0], colors[-1]
     am = re.match(r"\s*(?:to\s+(right|left|top|bottom)|(-?[\d.]+)deg?)", inner)
-    angle = 270.0  # CSS default direction is "to top"
+    angle = 0.0  # CSS default direction is "to top"
     if am:
         if am.group(1):
-            angle = {"right": 0, "left": 180, "top": 270, "bottom": 90}[am.group(1)]
+            angle = {"top": 0, "right": 90, "bottom": 180, "left": 270}[am.group(1)]
         else:
             angle = float(am.group(2)) % 360
-    angle = min((0, 90, 180, 270), key=lambda a: abs(a - angle))
-    gtype = 0 if angle in (0, 180) else 1  # 0: left->right, 1: top->bottom
-    start, end = (first, last) if angle in (0, 90) else (last, first)
+    # snap to nearest cardinal, circularly (350deg -> 0, not 270)
+    angle = min(
+        (0, 90, 180, 270),
+        key=lambda a: min(abs(a - angle), 360 - abs(a - angle)),
+    )
+    # DX GradientType: 0 = left->right, 1 = top->bottom.
+    # CSS: 0deg=to top, 90=to right, 180=to bottom, 270=to left; the first
+    # color sits at the origin end of the gradient line.
+    if angle in (90, 270):  # horizontal
+        gtype = 0
+        start, end = (first, last) if angle == 90 else (last, first)
+    else:  # vertical
+        gtype = 1
+        start, end = (first, last) if angle == 180 else (last, first)
     filt = (
         "progid:DXImageTransform.Microsoft.Gradient(GradientType=%d,"
         " StartColorStr='%s', EndColorStr='%s')" % (gtype, _to_hex(start), _to_hex(end))
@@ -335,8 +356,10 @@ def _transform_decls(body):
         g = _gradient_filter(v)
         if g:
             filters.append(g[0])
-            if p == "background":  # keep a solid fallback color
-                decls.append("background-color: %s" % g[1])
+            if p == "background":  # keep a solid fallback color (hex only)
+                hexc = _to_hex(g[1])
+                if hexc:
+                    decls.append("background-color: %s" % hexc)
             continue
         if p in ("filter", "-ms-filter"):
             if "progid:" in v.lower():  # already an IE filter -- keep it
@@ -368,7 +391,16 @@ def _transform_decls(body):
             "||document.body.scrollTop)+%g)" % top_off
         )
     if filters:
-        decls.append("filter: %s" % ", ".join(filters))
+        # IE6 only honours the FIRST filter in a list -- keep the most
+        # visually significant one (gradient > shadow > opacity).
+        def rank(f):
+            fl = f.lower()
+            if "gradient" in fl:
+                return 0
+            if "dropshadow" in fl:
+                return 1
+            return 2
+        decls.append("filter: %s" % min(filters, key=rank))
     return "; ".join(decls)
 
 
