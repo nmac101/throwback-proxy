@@ -309,7 +309,12 @@ def _gradient_filter(value):
 
 
 def _shadow_filter(value):
-    """IE6 DropShadow filter from the first box-shadow/text-shadow."""
+    """IE6 shadow filter from the first box-shadow/text-shadow.
+
+    Blurred shadows (the third length > 0) use the soft 'Shadow' filter;
+    sharp ones use the hard-edged 'DropShadow'.  A zero-offset DropShadow
+    is invisible behind an opaque element, so glows must use 'Shadow'.
+    """
     if "inset" in value.lower():
         return None
     lengths = re.findall(r"-?[\d.]+(?:px|em)", value)
@@ -319,9 +324,11 @@ def _shadow_filter(value):
     hexc = _to_hex(color_m.group(1))
     if not hexc:
         return None
+    blur = _px(lengths[2]) if len(lengths) > 2 else 0.0
+    name = "Shadow" if blur > 0 else "DropShadow"
     return (
-        "progid:DXImageTransform.Microsoft.DropShadow("
-        "OffX=%g,OffY=%g,Color='%s')" % (_px(lengths[0]), _px(lengths[1]), hexc)
+        "progid:DXImageTransform.Microsoft.%s("
+        "OffX=%g,OffY=%g,Color='%s')" % (name, _px(lengths[0]), _px(lengths[1]), hexc)
     )
 
 
