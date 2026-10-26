@@ -77,8 +77,7 @@ except ImportError:  # pragma: no cover
 HOST = "0.0.0.0"
 DEFAULT_PORT = 8080
 UPSTREAM_UA = (
-    "Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+    "Mozilla/5.0 (X11; Linux x86_64; rv:149.0) Gecko/20100101 Firefox/149.0"
 )
 
 # ---------------------------------------------------------------------------
