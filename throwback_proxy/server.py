@@ -41,6 +41,14 @@ except ImportError:  # pragma: no cover
     class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
         pass
 
+
+class _Server(ThreadingHTTPServer):
+    # A browser loading one page fires dozens of concurrent asset requests;
+    # the default listen backlog of 5 overflows and drops connections, which
+    # looks like the proxy "hanging".  Raise it well above a page's fan-out.
+    request_queue_size = 128
+
+
 def _make_tls_context():
     """Self-signed cert via the openssl CLI, cached in a temp dir."""
     d = os.path.join(tempfile.gettempdir(), "throwback-proxy-tls")
@@ -418,7 +426,10 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_PORT
-    srv = ThreadingHTTPServer((HOST, port), Handler)
+    srv = _Server((HOST, port), Handler)
+    # Let a handler thread stuck on a slow upstream die with the process
+    # instead of blocking Ctrl-C / shutdown.
+    srv.daemon_threads = True
     srv.ssl_ctx = _make_tls_context()
     print("Throwback Proxy listening on http://%s:%d/" % (HOST, port))
     print("Set it as your system/LAN proxy: <this machine's IP>:%d" % port)
