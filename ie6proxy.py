@@ -735,12 +735,12 @@ def transform_css(css, base, abs_base=None):
     css = re.sub(r"calc\(([^)]*)\)", lambda m: _eval_calc(m.group(1)), css)
     # IE6-era screens: assume ~1024x768 for vw/vh approximations
     css = re.sub(
-        r"([\d.]+)\s*vw",
+        r"(\d*\.?\d+)\s*vw",  # require >=1 digit so a lone '.' can't reach float()
         lambda m: "%dpx" % round(float(m.group(1)) * 10.24),
         css,
     )
     css = re.sub(
-        r"([\d.]+)\s*vh",
+        r"(\d*\.?\d+)\s*vh",  # require >=1 digit so a lone '.' can't reach float()
         lambda m: "%dpx" % round(float(m.group(1)) * 7.68),
         css,
     )
