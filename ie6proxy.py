@@ -1190,27 +1190,43 @@ def _margin_auto_classes(css):
     return out
 
 
-def _padding_bottoms(css, classes):
-    """Class -> padding-bottom (px) for the given classes (from a uniform
-    `padding:` shorthand or an explicit padding-bottom)."""
+def _container_metrics(css, classes):
+    """Class -> {"pl", "pb", "w"} (padding-left, padding-bottom, width in
+    px) from the element's own rule (selector ends with the class), so
+    absolutely-positioned children can be laid out like in-flow content."""
     out = {}
     for rm in re.finditer(r"([^{}]+)\{([^{}]*)\}", css):
         sel_text = rm.group(1).strip()
+        body = rm.group(2)
         for c in classes:
-            # the element's own rule only (selector ends with the class),
-            # not descendant rules like `.sidebar ul { padding: 0 }`
             if not re.search(r"(?<![\w-])" + re.escape(c) + r"\s*$",
                              sel_text):
                 continue
-            pm = re.search(r"(?<![\w-])padding-bottom\s*:\s*(\d+)px",
-                           rm.group(2), re.I)
-            if not pm:
-                pm = re.search(
-                    r"(?<![\w-])padding\s*:\s*(\d+)px"
-                    r"(?:\s+(?:\d+px)?\s*){0,2}[;}\s]",
-                    rm.group(2), re.I)
+            m = {"pl": 0, "pb": 0, "w": None}
+            pm = re.search(r"(?<![\w-])padding\s*:\s*([^;]+);?",
+                           body, re.I)
             if pm:
-                out[c] = int(pm.group(1))
+                parts = re.findall(r"\d+px", pm.group(1))
+                if parts:
+                    vals = [int(x[:-2]) for x in parts]
+                    if len(vals) == 1:
+                        t = r = b = l = vals[0]
+                    elif len(vals) == 2:
+                        t = b = vals[0]; r = l = vals[1]
+                    elif len(vals) == 3:
+                        t, r, b = vals; l = r
+                    else:
+                        t, r, b, l = vals[:4]
+                    m["pl"], m["pb"] = l, b
+            for prop, key in (("padding-left", "pl"), ("padding-bottom", "pb")):
+                em = re.search(r"(?<![\w-])" + prop + r"\s*:\s*(\d+)px",
+                               body, re.I)
+                if em:
+                    m[key] = int(em.group(1))
+            wm = re.search(r"(?<![\w-])width\s*:\s*(\d+)px", body, re.I)
+            if wm:
+                m["w"] = int(wm.group(1))
+            out[c] = m
     return out
 
 
@@ -1253,11 +1269,23 @@ def _bottom_pin_elements(html, bottom_classes, pinned, pads):
         )
         if not is_pinned:
             continue
-        pad = 0
+        # Lay the block out like in-flow content: inset by the container's
+        # padding, same width as the container's content box (IE6 doesn't
+        # reliably stretch absolutely-positioned elements with left+right).
+        pl = pb = 0
+        w = None
         if acm:
             for c in set(acm.group(1).split()):
-                pad = max(pad, pads.get(c, 0))
-        add = "position:absolute;left:0;right:0;bottom:%dpx;" % pad
+                mm = pads.get(c)
+                if mm:
+                    pl = max(pl, mm["pl"])
+                    pb = max(pb, mm["pb"])
+                    w = mm["w"] if w is None else w
+        if w is not None:
+            add = ("position:absolute;left:%dpx;width:%dpx;bottom:%dpx;"
+                   % (pl, w, pb))
+        else:
+            add = "position:absolute;left:0;right:0;bottom:%dpx;" % pb
         tag_text = html[m.start():m.end()]
         if re.search(r"\bstyle\s*=\s*[\"']", tag_text, re.I):
             tag_text = re.sub(
@@ -1557,7 +1585,7 @@ class Handler(BaseHTTPRequestHandler):
             text = _viewport_elements(text, vp)
             text = _bottom_pin_elements(
                 text, bottom, pinned,
-                _padding_bottoms("\n".join(css_chunks), pinned))
+                _container_metrics("\n".join(css_chunks), pinned))
             self._send(text, "text/html", 200, head_only)
             return
         if ctype == "text/css":
