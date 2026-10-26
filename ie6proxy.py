@@ -128,14 +128,14 @@ def to_proxy(url, abs_base=None):
     p = urlparse(url)
     if p.scheme not in ("http", "https") or not p.netloc:
         return url
+    # System-proxy mode (abs_base set): the browser is configured to send
+    # every http request to this proxy in absolute form, so links can keep
+    # their original URL -- no /<scheme>/<host>/... wrapping needed.
+    if abs_base:
+        return url
     path = p.path or "/"
     query = ("?" + p.query) if p.query else ""
-    rel = "/%s/%s%s%s" % (p.scheme, p.netloc, path, query)
-    # abs_base (e.g. "http://192.168.1.5:8080"): emit an absolute URL so the
-    # link still reaches the proxy when the page's own URL is on another host
-    # (system-proxy mode, where the browser resolves relatives against the
-    # origin site, not against us).
-    return (abs_base + rel) if abs_base else rel
+    return "/%s/%s%s%s" % (p.scheme, p.netloc, path, query)
 
 
 def from_proxy(path):
@@ -846,12 +846,10 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def _abs_base(self):
-        """Absolute base URL clients can use to reach this proxy.
-
-        In system-proxy mode the page's own URL is on the origin host, so
-        rewritten links must be absolute to keep resolving back to us. The
-        client's source IP is the address it used to reach us.
-        """
+        """Flag/URL for system-proxy mode (absolute-form, foreign-Host,
+        CONNECT-tunnel requests). Non-None tells the rewriters to keep
+        original absolute URLs instead of wrapping them in the proxy path
+        scheme -- the browser routes all http traffic through us anyway."""
         return "http://%s:%d" % (
             self.client_address[0], self.server.server_address[1]
         )
