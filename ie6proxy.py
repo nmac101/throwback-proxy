@@ -22,7 +22,9 @@ How it works:
                     this proxy.
       - text/css  : @media/@supports/@font-face/keyframes are removed,
                     flexbox rows are approximated with inline-block children,
-                    position:fixed becomes absolute + CSS expressions,
+                    position:fixed becomes absolute, pinned by a JS
+                    scroll handler (CSS expressions don't run in the
+                    standards mode the proxy forces via the doctype),
                     gradients/shadows/opacity become DXImageTransform filters,
                     rgba()/hsl() become rgb(), calc()/vw/vh are approximated,
                     unsupported properties and selectors are dropped, and
@@ -382,21 +384,11 @@ def _transform_decls(body):
             v = "absolute"
             fixed = True
         decls.append("%s: %s" % (prop.strip(), v))
-    if fixed:
-        # CSS expressions are the classic IE6 "position: fixed" hack.
-        tm = re.search(r"(?<![\w-])top\s*:\s*([^;]+)", body, re.I)
-        lm = re.search(r"(?<![\w-])left\s*:\s*([^;]+)", body, re.I)
-        top_off = _px(tm.group(1)) if tm else 0.0
-        left_off = _px(lm.group(1)) if lm else 0.0
-        decls.append("position: absolute")
-        decls.append(
-            "left: expression((document.documentElement.scrollLeft"
-            "||document.body.scrollLeft)+%g)" % left_off
-        )
-        decls.append(
-            "top: expression((document.documentElement.scrollTop"
-            "||document.body.scrollTop)+%g)" % top_off
-        )
+    # No extra work for fixed/sticky here: the element is absolute with its
+    # static top/left kept, and the HTML step (_pin_fixed_elements) adds a
+    # JS scroll handler.  CSS expression() -- the classic IE6 "position:
+    # fixed" hack -- is ignored in the standards mode the proxy forces via
+    # the XHTML Strict doctype, so it can't do the pinning.
     if filters:
         # IE6 only honours the FIRST filter in a list -- keep the most
         # visually significant one (gradient > shadow > opacity).
@@ -761,8 +753,9 @@ def _fixed_px_widths(css):
 
 
 def _pinned_classes(css):
-    """Class names whose rules use position: sticky/fixed (become absolute +
-    scroll expressions, i.e. they stay put while the page scrolls)."""
+    """Class names whose rules use position: sticky/fixed (become absolute,
+    pinned by a JS scroll handler, i.e. they stay put while the page
+    scrolls)."""
     pinned = set()
     for rm in re.finditer(r"([^{}]+)\{([^{}]*)\}", css):
         if not re.search(r"(?<![-\w])position\s*:\s*(?:sticky|fixed)",
@@ -780,8 +773,8 @@ def _flex_row_layout(html, flex_classes, widths, pinned=None):
     siblings get overflow:hidden so they wrap around the float and take the
     remaining width -- the classic pre-flex two-column pattern, rock solid in
     IE6. If such a child is also position:sticky/fixed (pinned), it becomes
-    position:absolute instead (floats can't stay put while scrolling; the CSS
-    rule already carries the scroll expressions) and its siblings get
+    position:absolute instead (floats can't stay put while scrolling; the
+    JS pin script keeps them in place) and its siblings get
     margin-left equal to its outer width. If no child has a known width, fall
     back to making all of them inline-block."""
     if not flex_classes:
@@ -855,6 +848,72 @@ def _flex_row_layout(html, flex_classes, widths, pinned=None):
         else:
             tag_text = tag_text[:-1] + ' style="%s">' % add
         html = html[:open_start] + tag_text + html[open_end:]
+    return html
+
+
+# IE6 ignores CSS expression() in standards mode (which the proxy forces
+# via the XHTML Strict doctype), so position:fixed elements are pinned by a
+# tiny scroll handler instead.  Elements are found by class (from the CSS)
+# or by an inline position:fixed style, and get a unique id.
+PIN_SCRIPT = (
+    "<script>(function(){var ids=[%s];var els=[];var i;"
+    "for(i=0;i<ids.length;i++){var el=document.getElementById(ids[i]);"
+    "if(el)els.push(el);}"
+    "if(!els.length)return;"
+    "var tops=[],lefts=[];"
+    "function off(el,p){var v=el.currentStyle?el.currentStyle[p]:'';"
+    "var n=parseInt(v,10);return isNaN(n)?0:n;}"
+    "function place(){var dl=document.documentElement,b=document.body;"
+    "var sl=(dl&&dl.scrollLeft)||b.scrollLeft||0;"
+    "var st=(dl&&dl.scrollTop)||b.scrollTop||0;"
+    "for(var j=0;j<els.length;j++){"
+    "els[j].style.left=(sl+lefts[j])+\"px\";"
+    "els[j].style.top=(st+tops[j])+\"px\";}}"
+    "function init(){for(i=0;i<els.length;i++){"
+    "tops.push(off(els[i],'top'));lefts.push(off(els[i],'left'));}"
+    "place();"
+    "if(window.attachEvent)window.attachEvent('onscroll',place);"
+    "else if(window.addEventListener)window.addEventListener('scroll',place,false);}"
+    "if(window.attachEvent)window.attachEvent('onload',init);"
+    "else if(window.addEventListener)window.addEventListener('load',init,false);"
+    "else init();"
+    "})()</script>"
+)
+
+
+def _pin_fixed_elements(html, pinned):
+    """Give position:fixed/sticky elements unique ids and inject the
+    PIN_SCRIPT scroll handler before </body> so they stay put while the
+    page scrolls (CSS expression() is ignored in IE6 standards mode)."""
+    if not pinned:
+        return html
+    ids = []
+    edits = []
+    for m in re.finditer(r"<([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)>", html):
+        attrs = m.group(2) or ""
+        if re.search(r"\bid\s*=", attrs, re.I):
+            continue  # already has an id; leave it alone
+        cm = re.search(r'class\s*=\s*["\']([^"\']*)["\']', attrs, re.I)
+        by_class = bool(cm and set(cm.group(1).split()) & pinned)
+        sm = re.search(r'style\s*=\s*["\']([^"\']*)["\']', attrs, re.I)
+        by_style = bool(
+            sm and re.search(r"position\s*:\s*(fixed|sticky)", sm.group(1), re.I)
+        )
+        if not (by_class or by_style):
+            continue
+        pid = "ie6pin-%d" % len(ids)
+        ids.append(pid)
+        edits.append((m.start(), m.end(), pid))
+    for start, end, pid in sorted(edits, reverse=True):
+        tag = html[start:end]
+        html = html[:start] + tag[:-1] + ' id="%s">' % pid + html[end:]
+    if not ids:
+        return html
+    script = PIN_SCRIPT % ",".join('"%s"' % i for i in ids)
+    if re.search(r"</body\s*>", html, re.I):
+        html = re.sub(r"</body\s*>", script + r"</body>", html, count=1, flags=re.I)
+    else:
+        html += script
     return html
 
 
@@ -1104,6 +1163,7 @@ class Handler(BaseHTTPRequestHandler):
                     pinned |= _pinned_classes(scss)
             text = transform_html(text, url, abs_base)
             text = _flex_row_layout(text, flex_classes, widths, pinned)
+            text = _pin_fixed_elements(text, pinned)
             self._send(text, "text/html", 200, head_only)
             return
         if ctype == "text/css":
