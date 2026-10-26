@@ -348,7 +348,7 @@ def _transform_decls(body):
             v = "inline" if "inline" in v else "block"
             if center and v == "block":
                 decls.append("text-align: center")
-        elif p == "position" and v.lower().startswith("fixed"):
+        elif p == "position" and v.lower() in ("fixed", "sticky"):
             v = "absolute"
             fixed = True
         decls.append("%s: %s" % (prop.strip(), v))
@@ -686,30 +686,68 @@ _VOID_TAGS = set(
 
 
 def _fixed_px_widths(css):
-    """class name -> fixed pixel width (40..600px) from simple class rules."""
+    """class name -> approximate outer pixel width (content width + horizontal
+    padding, 40..600px) from simple class rules."""
+    def hpad(body):
+        m = re.search(r"(?<![-\w])padding\s*:\s*([^;]+)", body, re.I)
+        if m:
+            vals = [int(x) for x in re.findall(r"(\d+)px", m.group(1))]
+            if len(vals) == 1:
+                return vals[0] * 2
+            if len(vals) == 2:
+                return vals[1] * 2
+            if len(vals) == 3:
+                return vals[1] * 2
+            if len(vals) == 4:
+                return vals[1] + vals[3]
+        tot = 0
+        for side in ("left", "right"):
+            m = re.search(r"padding-%s\s*:\s*(\d+)px" % side, body, re.I)
+            if m:
+                tot += int(m.group(1))
+        return tot
+
     widths = {}
     for rm in re.finditer(r"([^{}]+)\{([^{}]*)\}", css):
         sel, body = rm.group(1), rm.group(2)
         wm = re.search(r"(?<![-\w])width\s*:\s*(\d+)px", body, re.I)
         if not wm:
             continue
-        w = int(wm.group(1))
-        if not 40 <= w <= 600:
+        w = int(wm.group(1)) + hpad(body)
+        if not 40 <= w <= 700:
             continue
         for cm in re.finditer(r"\.([A-Za-z_][\w-]*)", sel):
             widths.setdefault(cm.group(1), w)
     return widths
 
 
-def _flex_row_layout(html, flex_classes, widths):
+def _pinned_classes(css):
+    """Class names whose rules use position: sticky/fixed (become absolute +
+    scroll expressions, i.e. they stay put while the page scrolls)."""
+    pinned = set()
+    for rm in re.finditer(r"([^{}]+)\{([^{}]*)\}", css):
+        if not re.search(r"(?<![-\w])position\s*:\s*(?:sticky|fixed)",
+                         rm.group(2), re.I):
+            continue
+        for cm in re.finditer(r"\.([A-Za-z_][\w-]*)", rm.group(1)):
+            pinned.add(cm.group(1))
+    return pinned
+
+
+def _flex_row_layout(html, flex_classes, widths, pinned=None):
     """IE6 has no flexbox. For each row-flex container element found in the
     HTML: children with a known fixed pixel width (e.g. a 225px sidebar) get
-    float:left; their siblings get overflow:hidden so they wrap around the
-    float and take the remaining width -- the classic pre-flex two-column
-    pattern, which is rock solid in IE6. If no child has a known width, fall
+    float:left (height:auto so the float box wraps all their content); their
+    siblings get overflow:hidden so they wrap around the float and take the
+    remaining width -- the classic pre-flex two-column pattern, rock solid in
+    IE6. If such a child is also position:sticky/fixed (pinned), it becomes
+    position:absolute instead (floats can't stay put while scrolling; the CSS
+    rule already carries the scroll expressions) and its siblings get
+    margin-left equal to its outer width. If no child has a known width, fall
     back to making all of them inline-block."""
     if not flex_classes:
         return html
+    pinned = pinned or set()
     edits = []  # (open_start, open_end, css-to-append)
     for m in re.finditer(r"<([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)>", html):
         attrs = m.group(2) or ""
@@ -746,11 +784,20 @@ def _flex_row_layout(html, flex_classes, widths):
             (not cd) and any(k in widths for k in cclasses)
             for _, _, cclasses, cd in children
         )
+        pinned_w = next(
+            (widths[k] for _, _, ccs, cd in children
+             if not cd for k in ccs if k in pinned and k in widths),
+            None,
+        )
         for cs, ce, cclasses, cd in children:
             if cd:  # keep explicit inline display untouched
                 continue
-            if has_floated and any(k in widths for k in cclasses):
-                add = "float:left;"
+            if pinned_w is not None and any(k in pinned for k in cclasses):
+                add = "position:absolute;left:0;"
+            elif has_floated and any(k in widths for k in cclasses):
+                add = "float:left;height:auto;"
+            elif pinned_w is not None:
+                add = "margin-left:%dpx;" % pinned_w
             elif has_floated:
                 add = "overflow:hidden;"
             else:
@@ -993,10 +1040,12 @@ class Handler(BaseHTTPRequestHandler):
             # stylesheets) so their children can be laid out side by side.
             flex_classes = set()
             widths = {}
+            pinned = set()
             for sm in re.finditer(r"<style\b[^>]*>(.*?)</style\s*>",
                                   text, re.I | re.S):
                 flex_classes |= _flex_container_classes(sm.group(1))
                 widths.update(_fixed_px_widths(sm.group(1)))
+                pinned |= _pinned_classes(sm.group(1))
             for lm in re.finditer(r"<link\b[^>]*>", text, re.I):
                 tag = lm.group(0)
                 if not re.search(r'rel\s*=\s*["\']?stylesheet', tag, re.I):
@@ -1013,8 +1062,9 @@ class Handler(BaseHTTPRequestHandler):
                     scss = sdata.decode("utf-8", "replace")
                     flex_classes |= _flex_container_classes(scss)
                     widths.update(_fixed_px_widths(scss))
+                    pinned |= _pinned_classes(scss)
             text = transform_html(text, url, abs_base)
-            text = _flex_row_layout(text, flex_classes, widths)
+            text = _flex_row_layout(text, flex_classes, widths, pinned)
             self._send(text, "text/html", 200, head_only)
             return
         if ctype == "text/css":
