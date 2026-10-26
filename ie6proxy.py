@@ -1174,6 +1174,105 @@ def _bg_image_elements(html, bg, base, abs_base=None):
     return html
 
 
+# margin-top:auto (the flexbox idiom for "push to the bottom of the
+# column") is meaningless in IE6.  When the element sits inside a pinned
+# (positioned, full-height) container we anchor it to that container's
+# bottom with position:absolute instead.
+_TAG_RE = re.compile(r"</?([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)>")
+
+
+def _margin_auto_classes(css):
+    """Classes whose rules use margin-top:auto."""
+    out = set()
+    for rm in re.finditer(r"([^{}]+)\{([^{}]*)\}", css):
+        if re.search(r"(?<![\w-])margin-top\s*:\s*auto", rm.group(2), re.I):
+            out.update(re.findall(r"\.([A-Za-z_][\w-]*)", rm.group(1)))
+    return out
+
+
+def _padding_bottoms(css, classes):
+    """Class -> padding-bottom (px) for the given classes (from a uniform
+    `padding:` shorthand or an explicit padding-bottom)."""
+    out = {}
+    for rm in re.finditer(r"([^{}]+)\{([^{}]*)\}", css):
+        sel_text = rm.group(1).strip()
+        for c in classes:
+            # the element's own rule only (selector ends with the class),
+            # not descendant rules like `.sidebar ul { padding: 0 }`
+            if not re.search(r"(?<![\w-])" + re.escape(c) + r"\s*$",
+                             sel_text):
+                continue
+            pm = re.search(r"(?<![\w-])padding-bottom\s*:\s*(\d+)px",
+                           rm.group(2), re.I)
+            if not pm:
+                pm = re.search(
+                    r"(?<![\w-])padding\s*:\s*(\d+)px"
+                    r"(?:\s+(?:\d+px)?\s*){0,2}[;}\s]",
+                    rm.group(2), re.I)
+            if pm:
+                out[c] = int(pm.group(1))
+    return out
+
+
+def _nearest_ancestor(html, pos):
+    """Match of the nearest open ancestor tag before `pos` (or None)."""
+    stack = []
+    for tm in _TAG_RE.finditer(html, 0, pos):
+        name, attrs = tm.group(1).lower(), tm.group(2) or ""
+        if tm.group(0)[1] == "/":
+            if stack and stack[-1].group(1).lower() == name:
+                stack.pop()
+        elif name not in _VOID_TAGS and not attrs.rstrip().endswith("/"):
+            stack.append(tm)
+    return stack[-1] if stack else None
+
+
+def _bottom_pin_elements(html, bottom_classes, pinned, pads):
+    """Anchor margin-top:auto elements to the bottom of their pinned
+    (positioned) ancestor -- the IE6 equivalent of the flexbox idiom."""
+    if not bottom_classes:
+        return html
+    edits = []
+    for m in re.finditer(r"<([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)>", html):
+        if m.group(1).lower() in _VOID_TAGS:
+            continue
+        attrs = m.group(2) or ""
+        cm = re.search(r'class\s*=\s*["\']([^"\']*)["\']', attrs, re.I)
+        if not cm or not (set(cm.group(1).split()) & bottom_classes):
+            continue
+        anc = _nearest_ancestor(html, m.start())
+        if not anc:
+            continue
+        aattrs = anc.group(2) or ""
+        acm = re.search(r'class\s*=\s*["\']([^"\']*)["\']', aattrs, re.I)
+        asm = re.search(r'style\s*=\s*["\']([^"\']*)["\']', aattrs, re.I)
+        is_pinned = bool(
+            (acm and set(acm.group(1).split()) & pinned)
+            or (asm and re.search(
+                r"position\s*:\s*(absolute|fixed)", asm.group(1), re.I))
+        )
+        if not is_pinned:
+            continue
+        pad = 0
+        if acm:
+            for c in set(acm.group(1).split()):
+                pad = max(pad, pads.get(c, 0))
+        add = "position:absolute;left:0;right:0;bottom:%dpx;" % pad
+        tag_text = html[m.start():m.end()]
+        if re.search(r"\bstyle\s*=\s*[\"']", tag_text, re.I):
+            tag_text = re.sub(
+                r"(\bstyle\s*=\s*[\"'])([^\"']*)",
+                lambda mm: mm.group(1) + mm.group(2) + add,
+                tag_text, count=1, flags=re.I,
+            )
+        else:
+            tag_text = tag_text[:-1] + ' style="%s">' % add
+        edits.append((m.start(), m.end(), tag_text))
+    for start, end, repl in sorted(edits, reverse=True):
+        html = html[:start] + repl + html[end:]
+    return html
+
+
 def _make_tls_context():
     """Self-signed cert via the openssl CLI, cached in a temp dir."""
     d = os.path.join(tempfile.gettempdir(), "ie6proxy-tls")
@@ -1398,15 +1497,19 @@ class Handler(BaseHTTPRequestHandler):
             pinned = set()
             vp = {}
             bg = {}
+            bottom = set()
             body_filter = None
+            css_chunks = []
             for sm in re.finditer(r"<style\b[^>]*>(.*?)</style\s*>",
                                   text, re.I | re.S):
+                css_chunks.append(sm.group(1))
                 flex_classes |= _flex_container_classes(sm.group(1))
                 widths.update(_fixed_px_widths(sm.group(1)))
                 pinned |= _pinned_classes(sm.group(1))
                 for k, v in _viewport_classes(sm.group(1)).items():
                     vp.setdefault(k, []).extend(v)
                 bg.update(_bg_image_classes(sm.group(1)))
+                bottom |= _margin_auto_classes(sm.group(1))
                 body_filter = body_filter or _body_gradient_filter(sm.group(1))
             for lm in re.finditer(r"<link\b[^>]*>", text, re.I):
                 tag = lm.group(0)
@@ -1422,12 +1525,14 @@ class Handler(BaseHTTPRequestHandler):
                 _, _, sdata = http_get(su, timeout=5)
                 if sdata:
                     scss = sdata.decode("utf-8", "replace")
+                    css_chunks.append(scss)
                     flex_classes |= _flex_container_classes(scss)
                     widths.update(_fixed_px_widths(scss))
                     pinned |= _pinned_classes(scss)
                     for k, v in _viewport_classes(scss).items():
                         vp.setdefault(k, []).extend(v)
                     bg.update(_bg_image_classes(scss))
+                    bottom |= _margin_auto_classes(scss)
                     body_filter = body_filter or _body_gradient_filter(scss)
             text = transform_html(text, url, abs_base)
             text = _bg_image_elements(text, bg, url, abs_base)
@@ -1450,6 +1555,9 @@ class Handler(BaseHTTPRequestHandler):
             text = _flex_row_layout(text, flex_classes, widths, pinned)
             text = _pin_fixed_elements(text, pinned)
             text = _viewport_elements(text, vp)
+            text = _bottom_pin_elements(
+                text, bottom, pinned,
+                _padding_bottoms("\n".join(css_chunks), pinned))
             self._send(text, "text/html", 200, head_only)
             return
         if ctype == "text/css":
