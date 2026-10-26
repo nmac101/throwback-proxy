@@ -73,16 +73,21 @@ _IM = next((shutil.which(t) for t in ("magick", "convert") if shutil.which(t)),
            None)
 
 
-def _svg_to_png(data):
-    """SVG -> PNG via ImageMagick (optional).  IE6 cannot render SVG; the
-    image is rendered at its intrinsic size and scaled by the page's own
-    <img>/CSS sizing."""
+def _svg_to_png(data, width=None):
+    """SVG -> PNG via ImageMagick (optional).  IE6 cannot render SVG.  When
+    *width* is given the PNG is rendered at that width (aspect preserved) so
+    the browser shows it 1:1 -- IE6 paints the alpha of a *scaled* transparent
+    PNG black, so we avoid making it scale."""
     if not _IM:
         return None
     try:
+        cmd = [_IM, "-background", "transparent", "-depth", "8", "svg:-"]
+        if width:
+            # -resize is an operation, so it must follow the input image
+            cmd += ["-resize", "%dx" % width]
+        cmd += ["png:-"]
         r = subprocess.run(
-            [_IM, "-background", "transparent", "-depth", "8",
-             "svg:-", "png:-"],
+            cmd,
             input=data, capture_output=True, timeout=15,
         )
         if r.returncode == 0 and r.stdout:
@@ -1350,6 +1355,11 @@ def _bg_image_elements(html, bg, base, abs_base=None):
             continue
         raw_url, size, px_w, px_h = hit
         img_url = to_proxy(urljoin(base, html_unescape(raw_url)), abs_base)
+        if px_w and img_url.lower().endswith(".svg"):
+            # tell the image phase to render the SVG at display width so IE6
+            # shows the PNG 1:1 (it paints scaled transparent-PNG alpha black)
+            img_url += ("?" if "?" not in img_url else "&") + \
+                "ie6w=%d" % px_w
         if px_w:
             img_style = "width:%dpx" % px_w
             if size == "cover" and px_h:  # cover ~ stretch in IE6
@@ -1691,6 +1701,22 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
+        # Optional ?ie6w=<px> hint (added by the proxy itself when it injects
+        # a background <img>): render the SVG at that width so IE6 shows the
+        # PNG 1:1.  Stripped before the upstream fetch.
+        svg_width = None
+        _p = urlparse(url)
+        if _p.query:
+            _kept, _w = [], None
+            for _pair in _p.query.split("&"):
+                if _pair.startswith("ie6w="):
+                    _w = _pair.split("=", 1)[1]
+                else:
+                    _kept.append(_pair)
+            if _w and _w.isdigit():
+                svg_width = int(_w)
+            url = _p._replace(query="&".join(_kept)).geturl()
+
         # --- ad blocking (no upstream request at all) ---
         if _is_ad_url(url):
             p = urlparse(url)
@@ -1818,7 +1844,7 @@ class Handler(BaseHTTPRequestHandler):
             ctype = "image/png"
         if (ctype == "image/svg+xml" or url.lower().endswith(".svg")) \
                 and _svg_to_png:
-            png = _svg_to_png(body)
+            png = _svg_to_png(body, svg_width)
             if png:
                 body, ctype = png, "image/png"
 
