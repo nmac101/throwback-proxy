@@ -1,4 +1,5 @@
 # Throwback Proxy
+## Backporting the modern internet to old browsers
 
 An HTTP proxy in pure Python (stdlib only) that rewrites modern web pages so
 they can be rendered by **Internet Explorer 6**, mostly preserving the original

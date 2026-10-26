@@ -153,16 +153,37 @@ def _pinned_classes(css):
     return pinned
 
 
-def _flex_sibling_floats(html, flex_classes):
+def _full_width_classes(css):
+    """Class names of simple rules that set width:100% (full-bleed blocks).
+    Floating one of these consumes the whole line, which shrinks the
+    available width of the next block-level box to zero (CSS 2.1 9.5.1) --
+    e.g. a full-width header float:left collapses the page grid that
+    follows it."""
+    names = set()
+    for rm in re.finditer(r"([^{}]+)\{([^{}]*)\}", css):
+        sel, body = rm.group(1), rm.group(2)
+        if not re.search(r"(?<![-\w])width\s*:\s*100%\s*(?:;|$)", body, re.I):
+            continue
+        for part in sel.split(","):
+            cm = list(re.finditer(r"\.([A-Za-z_][\w-]*)", part))
+            if cm:
+                names.add(cm[-1].group(1))
+    return names
+
+
+def _flex_sibling_floats(html, flex_classes, full_width=None):
     """Float flex containers that are siblings of other flex containers.
     Handles the common 'row of sub-rows' pattern (e.g. a header with a left
     group and a right group, each a flex row) where the parent is a plain
     block and the sub-rows would otherwise stack vertically.  Only applies
     when the parent itself is not a flex container (that case is handled by
-    _flex_row_layout's child pass)."""
+    _flex_row_layout's child pass).  Full-width (width:100%) flex containers
+    are excluded: they can't share a line with a sibling, and floating them
+    collapses the width of the content that follows."""
     if not flex_classes:
         return []
-    els = []  # {start, end, flex, parent}
+    full_width = full_width or set()
+    els = []  # {start, end, flex, cls, parent}
     open_stack = []  # (tag, index_in_els)
     for m in re.finditer(r"</?([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)>", html):
         closing, tag, attrs = m.group(0)[1] == "/", m.group(1).lower(), m.group(2) or ""
@@ -177,14 +198,16 @@ def _flex_sibling_floats(html, flex_classes):
         cls = set(cm.group(1).split()) if cm else set()
         idx = len(els)
         els.append({"start": m.start(), "end": m.end(),
-                    "flex": bool(cls & flex_classes), "parent": parent})
+                    "flex": bool(cls & flex_classes), "cls": cls,
+                    "parent": parent})
         open_stack.append((tag, idx))
     by_parent = {}
     for e in els:
         by_parent.setdefault(e["parent"], []).append(e)
     edits = []
     for parent, kids in by_parent.items():
-        flex_kids = [k for k in kids if k["flex"]]
+        flex_kids = [k for k in kids
+                     if k["flex"] and not (k["cls"] & full_width)]
         if len(flex_kids) >= 2 and (parent < 0 or not els[parent]["flex"]):
             for k in flex_kids:
                 edits.append((k["start"], k["end"], "float:left;"))
@@ -280,7 +303,7 @@ def _apply_style_edits(html, edits):
     return html
 
 
-def _flex_row_layout(html, flex_classes, widths, pinned=None):
+def _flex_row_layout(html, flex_classes, widths, pinned=None, full_width=None):
     """IE6 has no flexbox. For each row-flex container element found in the
     HTML: children with a known fixed pixel width (e.g. a fixed-width sidebar)
     float:left (height:auto so the float box wraps all their content); their
@@ -294,6 +317,7 @@ def _flex_row_layout(html, flex_classes, widths, pinned=None):
     if not flex_classes:
         return html
     pinned = pinned or set()
+    full_width = full_width or set()
     edits = []  # (open_start, open_end, css-to-append)
     for m in re.finditer(r"<([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)>", html):
         attrs = m.group(2) or ""
@@ -356,8 +380,13 @@ def _flex_row_layout(html, flex_classes, widths, pinned=None):
         if all_float:
             # clearfix on the container so it wraps the floated children
             edits.append((m.start(), m.end(), "overflow:hidden;"))
-    edits.extend(_flex_sibling_floats(html, flex_classes))
-    return _apply_style_edits(html, edits)
+    edits.extend(_flex_sibling_floats(html, flex_classes, full_width))
+    # _apply_tag_edits, not _apply_style_edits: the child pass and
+    # _flex_sibling_floats can both target the same element (a flex
+    # container that is itself a child of a row), and applying two edits
+    # to one tag out of order slices the grown tag at the original
+    # offsets, leaking a bare style="..."> fragment into the page text.
+    return _apply_tag_edits(html, edits)
 
 
 def _apply_tag_edits(html, edits):

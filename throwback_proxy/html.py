@@ -134,7 +134,10 @@ def transform_html(html, base, abs_base=None):
     )
 
     def _clean_script_open(m):
-        return re.sub(r"\s(?:defer|async)\b", "", m.group(0))
+        # Drop the whole attribute, including an optional ="value"; leaving
+        # a bare "=" behind produces <script=""> whose empty attribute name
+        # breaks HTML5 parsers (the script gets moved out of <head>).
+        return re.sub(r"\s(?:defer|async)(?:\s*=\s*[^>\s]*)?", "", m.group(0))
 
     html = re.sub(r"<script\b[^>]*>", _clean_script_open, html, flags=re.I)
 
