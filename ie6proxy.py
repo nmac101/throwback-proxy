@@ -1130,6 +1130,88 @@ def _flex_sibling_floats(html, flex_classes):
     return edits
 
 
+def _float_classes(css):
+    """Class/id names of the last selector component in each rule that sets
+    float:left/right (e.g. a navbar logo float:left and menu float:right)."""
+    names = set()
+    for rm in re.finditer(r"([^{}]+)\{([^{}]*)\}", css):
+        sel, body = rm.group(1), rm.group(2)
+        if not re.search(r"(?<![-\w])float\s*:\s*(?:left|right)\b", body, re.I):
+            continue
+        for part in sel.split(","):
+            cm = list(re.finditer(r"\.([A-Za-z_][\w-]*)", part))
+            if cm:
+                names.add(cm[-1].group(1))
+                continue
+            im = list(re.finditer(r"#([A-Za-z_][\w-]*)", part))
+            if im:
+                names.add(im[-1].group(1))
+    return names
+
+
+def _clearfix_floated_parents(html, float_classes):
+    """Add overflow:hidden (clearfix) to elements that contain a floated
+    child (matched by class/id) but don't already clear it.  In IE6 a block
+    with floated children and no BFC lets the *next* sibling flow around the
+    floats -- e.g. a navbar with a float:left logo and float:right menu makes
+    the following header wrap up into the navbar's top-right corner."""
+    if not float_classes:
+        return []
+    els = []  # {start, end, cls, id, parent, has_oh}
+    open_stack = []  # (tag, index_in_els)
+    for m in re.finditer(r"</?([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)>", html):
+        closing, tag, attrs = m.group(0)[1] == "/", m.group(1).lower(), m.group(2) or ""
+        if closing:
+            if open_stack and open_stack[-1][0] == tag:
+                open_stack.pop()
+            continue
+        if tag in _VOID_TAGS or attrs.rstrip().endswith("/"):
+            continue
+        parent = open_stack[-1][1] if open_stack else -1
+        cm = re.search(r'class\s*=\s*["\']([^"\']*)["\']', attrs, re.I)
+        im = re.search(r'id\s*=\s*["\']([^"\']*)["\']', attrs, re.I)
+        cls = set(cm.group(1).split()) if cm else set()
+        idn = im.group(1) if im else ""
+        sm = re.search(r'style\s*=\s*["\']([^"\']*)["\']', attrs, re.I)
+        has_oh = bool(sm and re.search(r"overflow\s*:\s*hidden", sm.group(1), re.I))
+        idx = len(els)
+        els.append({"start": m.start(), "end": m.end(),
+                    "cls": cls, "id": idn, "parent": parent, "has_oh": has_oh})
+        open_stack.append((tag, idx))
+    by_parent = {}
+    for i, e in enumerate(els):
+        by_parent.setdefault(e["parent"], []).append(i)
+    edits = []
+    for i, e in enumerate(els):
+        if e["has_oh"]:
+            continue
+        kids = by_parent.get(i, [])
+        if any((els[k]["cls"] & float_classes) or (els[k]["id"] in float_classes)
+               for k in kids):
+            edits.append((e["start"], e["end"], "overflow:hidden;"))
+    return edits
+
+
+def _apply_edits(html, edits):
+    """Apply a list of (open_start, open_end, css-to-append) edits to the
+    HTML, appending css to each target tag's style attribute (creating one if
+    absent). Edits are applied back-to-front so earlier offsets stay valid."""
+    for open_start, open_end, add in sorted(edits, reverse=True):
+        tag_text = html[open_start:open_end]
+        if re.search(r"\bstyle\s*=\s*[\"']", tag_text, re.I):
+            tag_text = re.sub(
+                r"(\bstyle\s*=\s*[\"'])([^\"']*)",
+                lambda mm: mm.group(1) + mm.group(2) + add,
+                tag_text,
+                count=1,
+                flags=re.I,
+            )
+        else:
+            tag_text = tag_text[:-1] + ' style="%s">' % add
+        html = html[:open_start] + tag_text + html[open_end:]
+    return html
+
+
 def _flex_row_layout(html, flex_classes, widths, pinned=None):
     """IE6 has no flexbox. For each row-flex container element found in the
     HTML: children with a known fixed pixel width (e.g. a fixed-width sidebar)
@@ -1408,11 +1490,17 @@ def _bg_image_classes(css):
     images (and a width:100%-ish div with no height collapses to nothing),
     so the HTML step replaces the image with a nested <img> that scales
     like the requested size."""
+    # Only top-level rules survive transform_css (it strips @media/@supports),
+    # so scan the same subset -- otherwise a mobile media-query rule (e.g. a
+    # small icon logo) clobbers the desktop one.
+    css = _strip_at_blocks(css, ["media", "supports"])
     out = {}
     for rm in re.finditer(r"([^{}]+)\{([^{}]*)\}", css):
         body = rm.group(2)
         sm = re.search(
-            r"background-size\s*:\s*(cover|contain|100%)", body, re.I)
+            r"background-size\s*:\s*(cover|contain|100%|"
+            r"(\d+)px(?:\s+(\d+)px)?)",
+            body, re.I)
         if not sm:
             continue
         bm = re.search(
@@ -1421,14 +1509,18 @@ def _bg_image_classes(css):
         )
         if not bm:
             continue
-        # explicit px geometry from the same rule: IE6 mishandles
-        # percentage widths on <img> inside floats, so the injected img
-        # gets pixel dimensions whenever the rule provides them
+        # explicit px geometry: IE6 mishandles percentage widths on <img>
+        # inside floats, so the injected img gets pixel dimensions.  An
+        # explicit "background-size: Wpx Hpx" wins over the rule's own
+        # width/height (the two often differ, e.g. a 190px logo in a wider
+        # box).
+        bs_w = int(sm.group(2)) if sm.group(2) else None
+        bs_h = int(sm.group(3)) if sm.group(3) else None
         wm = re.search(r"(?<![\w-])width\s*:\s*(\d+)px", body, re.I)
         hm = re.search(r"(?<![\w-])height\s*:\s*(\d+)px", body, re.I)
         entry = (bm.group(2), sm.group(1).lower(),
-                 int(wm.group(1)) if wm else None,
-                 int(hm.group(1)) if hm else None)
+                 bs_w or (int(wm.group(1)) if wm else None),
+                 bs_h or (int(hm.group(1)) if hm else None))
         # only the LAST class/id of the selector (most specific) -- mapping
         # ancestor classes too would inject the img into their elements
         cls = re.findall(r"\.([A-Za-z_][\w-]*)", rm.group(1))
@@ -1475,7 +1567,7 @@ def _bg_image_elements(html, bg, base, abs_base=None):
                 "ie6w=%d" % px_w
         if px_w:
             img_style = "width:%dpx" % px_w
-            if size == "cover" and px_h:  # cover ~ stretch in IE6
+            if px_h:  # explicit px (or cover) ~ stretch in IE6
                 img_style += ";height:%dpx" % px_h
         else:
             img_style = "width:100%"
@@ -1882,6 +1974,7 @@ class Handler(BaseHTTPRequestHandler):
             vp = {}
             bg = {}
             bottom = set()
+            float_classes = set()
             body_filter = None
             css_chunks = []
             for sm in re.finditer(r"<style\b[^>]*>(.*?)</style\s*>",
@@ -1897,6 +1990,7 @@ class Handler(BaseHTTPRequestHandler):
                 bg.update(_bg_image_classes(
                     transform_css(sm.group(1), url, abs_base)))
                 bottom |= _margin_auto_classes(sm.group(1))
+                float_classes |= _float_classes(sm.group(1))
                 body_filter = body_filter or _body_gradient_filter(sm.group(1))
             for lm in re.finditer(r"<link\b[^>]*>", text, re.I):
                 tag = lm.group(0)
@@ -1921,6 +2015,7 @@ class Handler(BaseHTTPRequestHandler):
                     bg.update(_bg_image_classes(
                         transform_css(scss, su, abs_base)))
                     bottom |= _margin_auto_classes(scss)
+                    float_classes |= _float_classes(scss)
                     body_filter = body_filter or _body_gradient_filter(scss)
             text = transform_html(text, url, abs_base)
 
@@ -1952,6 +2047,8 @@ class Handler(BaseHTTPRequestHandler):
                     r"(<body\b[^>]*>)", r"\1" + bgdiv, text, count=1, flags=re.I
                 )
             text = _flex_row_layout(text, flex_classes, widths, pinned)
+            text = _apply_edits(text, _clearfix_floated_parents(
+                text, float_classes))
             text = _pin_fixed_elements(text, pinned)
             text = _viewport_elements(text, vp)
             text = _bottom_pin_elements(
