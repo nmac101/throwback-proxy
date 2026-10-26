@@ -83,7 +83,8 @@ delivered; without `openssl`, `http://` sites work but `https://` ones fail.
 - **CSS nesting is flattened** (nested rules and `&` parent references, as used by archlinux.org's navbar) and **custom properties are resolved**: `var(--name[, fallback])` is substituted from `--name` definitions in the sheet (custom properties inherit in CSS, so definitions on a component's root rule reach its nested rules), and the `--*` declarations are dropped.
 - Fully-transparent `rgba(0,0,0,0)` / 4-value `rgb(0,0,0,0)` is dropped from shorthand values: a 4-value `rgb()` would invalidate the whole declaration in IE6 and take e.g. the `url()` layer of a `background` shorthand down with it.
 - `max-width` + `margin: auto` (the common centring idiom, e.g. on `body`) → plain `width`: IE6 ignores `max-width`, and `margin: auto` only centres a block with an explicit width.
-- Unsupported properties (`border-radius`, `transform`, `transition`, `animation`, ...) and selectors (`:not()`, `:nth-*`, `:is()`, `:where()`, `:has()`, ...) removed.
+- Unsupported properties (`border-radius`, `transform`, `transition`, `animation`, ...) and selectors (`:not()`, `:nth-*`, `:is()`, `:where()`, `:has()`, ...) removed. Other selector syntax IE6 can't parse is *degraded* to the closest supported form instead of dropping the whole rule: `a > b` → `a b` (child → descendant), `el[attr]` → `el`, `el:first-child` → `el`, `:root` → `html`, vendor pseudo-classes (`:-moz-focus-inner`, ...) dropped. `:hover`/`:focus`/`:before`/`:after` and `+`/`~` are left for IE6 to drop (degrading them would mis-style); `.a.b` is kept as-is since IE6 already reads it as the last class only.
+- Duplicate declarations in one rule are de-duplicated, keeping the last value but preferring `!important`: IE6 lets a later plain declaration override an earlier `!important` one in the same rule.
 - `::pseudo` → `:pseudo`; all `url()` references rewritten through the proxy.
 
 ### Images

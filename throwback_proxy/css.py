@@ -66,11 +66,12 @@ BAD_SELECTOR_RE = re.compile(
 
 
 def _strip_simple_nots(sel):
-    """Remove :not(<simple>) occurrences from a selector.  IE6 supports
-    :not() with a single simple argument (tag, .class, #id, :focus, ...),
-    e.g. MediaWiki's `.mw-jump-link:not(:focus)` screen-reader hide trick --
-    dropping those rules leaves the hidden helper links visible.  Complex
-    arguments are left in place so BAD_SELECTOR_RE still catches them."""
+    """Remove :not(<simple>) occurrences from a selector.  IE6 has no
+    :not() at all (an IE7+ feature), so e.g. MediaWiki's
+    `.mw-jump-link:not(:focus)` screen-reader hide trick would be dropped
+    rule-by-rule; stripping the pseudo lets the rule survive and apply to
+    every match.  Complex arguments are left in place so BAD_SELECTOR_RE
+    still catches them."""
     out = sel
     while True:
         m = re.search(r":not\(", out)
@@ -545,6 +546,18 @@ def _transform_decls(body):
     # JS scroll handler.  CSS expression() -- the classic IE6 "position:
     # fixed" hack -- is ignored in the standards mode the proxy forces via
     # the XHTML Strict doctype, so it can't do the pinning.
+    # IE6 quirk: a later plain declaration overrides an earlier !important
+    # one in the same rule, so de-duplicate per property, keeping the last
+    # value but preferring the !important variant.
+    seen = {}
+    for d in decls:
+        p, _, v = d.partition(":")
+        key = p.strip().lower()
+        imp = v.strip().endswith("!important")
+        old = seen.get(key)
+        if old is None or imp or not old[1]:
+            seen[key] = (d, imp)
+    decls = [d for d, _ in seen.values()]
     if filters:
         # IE6 only honours the FIRST filter in a list -- keep the most
         # visually significant one (gradient > shadow > opacity).
@@ -585,12 +598,41 @@ def _rewrite_css_urls(css, base, abs_base=None):
     return re.sub(r"url\(\s*(['\"]?)(.*?)\1\s*\)", sub, css)
 
 
+def _degrade_selector(sel):
+    """Approximate selector syntax IE6 cannot parse.
+
+    IE6 only understands element, #id, .class, * and the descendant
+    combinator (plus :link/:visited/:active/:hover on <a>); a rule
+    containing anything else is dropped by IE6 entirely.  The common cases
+    degrade cleanly to the closest supported form:
+
+      a > b          -> a b          (child -> descendant)
+      el[attr]       -> el           (drop the attribute selector)
+      el:first-child -> el           (apply to every match)
+      :root          -> html
+      el:-moz-x      -> el           (drop vendor pseudo-classes)
+
+    Multiple classes (.a.b) are left alone: IE6 already reads them as the
+    last class only.  :hover/:focus/:before/:after and the + / ~ sibling
+    combinators are left in place -- degrading them would mis-style, so IE6
+    simply drops those rules."""
+    sel = re.sub(r":root\b", "html", sel)
+    sel = re.sub(r"\s*>\s*", " ", sel)
+    sel = re.sub(r"\[[^\]]*\]", "", sel)
+    sel = re.sub(r":first-child", "", sel)
+    sel = re.sub(r":-(?:moz|webkit|ms|o)-[a-z-]+", "", sel)
+    # drops above can empty out a comma-list part (e.g. [type='button'])
+    return ",".join(p for p in (s.strip() for s in sel.split(",")) if p)
+
+
 def _filter_rules(css):
     def sub(m):
         sel, body = m.group(1), m.group(2)
         sel = sel.replace("::", ":")  # IE6 uses single-colon pseudos
-        if BAD_SELECTOR_RE.search(_strip_simple_nots(sel)):
+        sel = _strip_simple_nots(sel)
+        if BAD_SELECTOR_RE.search(sel):
             return ""
+        sel = _degrade_selector(sel)
         decls = _transform_decls(body)
         if not decls:
             return ""
