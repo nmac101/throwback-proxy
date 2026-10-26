@@ -917,6 +917,97 @@ def _pin_fixed_elements(html, pinned):
     return html
 
 
+# Viewport units (vw/vh) are statically approximated as 1024x768 in the CSS
+# (a safe fallback), but elements sized in viewport units should track the
+# real window: they get a unique id and a resize handler, like the pinned
+# elements.  box-sizing:border-box is not understood by IE6, so the element's
+# own padding is subtracted to approximate it.
+VP_SCRIPT = (
+    "<script>(function(){var els=[%(els)s];"
+    "function px(v){var n=parseInt(v,10);return isNaN(n)?0:n;}"
+    "function size(){"
+    "var dl=document.documentElement,b=document.body;"
+    "var h=(dl&&dl.clientHeight)||b.clientHeight||768;"
+    "var w=(dl&&dl.clientWidth)||b.clientWidth||1024;"
+    "for(var i=0;i<els.length;i++){"
+    "var e=document.getElementById(els[i].id);if(!e)continue;"
+    "var cs=e.currentStyle;"
+    "var pad=els[i].p=='height'"
+    "?px(cs.paddingTop)+px(cs.paddingBottom)"
+    ":px(cs.paddingLeft)+px(cs.paddingRight);"
+    "var v=els[i].f*(els[i].p=='height'?h:w)-pad;"
+    "if(v>0)e.style[els[i].p]=v+'px';}}"
+    "function init(){size();"
+    "if(window.attachEvent)window.attachEvent('onresize',size);"
+    "else if(window.addEventListener)window.addEventListener('resize',size,false);}"
+    "if(window.attachEvent)window.attachEvent('onload',init);"
+    "else if(window.addEventListener)window.addEventListener('load',init,false);"
+    "else init();"
+    "})()</script>"
+)
+
+
+def _viewport_classes(css):
+    """Class names whose rules use vw/vh lengths, mapped to the (property,
+    fraction-of-viewport) pairs, e.g. {'sidebar': [('height', 1.0)]}."""
+    vp = {}
+    for rm in re.finditer(r"([^{}]+)\{([^{}]*)\}", css):
+        for prop, unit in (("height", "vh"), ("width", "vw")):
+            pm = re.search(
+                r"(?<![\w-])%s\s*:\s*([\d.]+)\s*%s" % (prop, unit),
+                rm.group(2), re.I,
+            )
+            if not pm:
+                continue
+            for cm in re.finditer(r"\.([A-Za-z_][\w-]*)", rm.group(1)):
+                vp.setdefault(cm.group(1), []).append(
+                    (prop, float(pm.group(1)) / 100.0)
+                )
+    return vp
+
+
+def _viewport_elements(html, vp):
+    """Give vw/vh-sized elements unique ids and inject the VP_SCRIPT resize
+    handler before </body> so they track the real window size (the CSS only
+    carries a static 1024x768 approximation)."""
+    if not vp:
+        return html
+    specs = []  # (id, prop, factor)
+    edits = []  # (start, end, id) -- only elements needing a new id
+    for m in re.finditer(r"<([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)>", html):
+        attrs = m.group(2) or ""
+        cm = re.search(r'class\s*=\s*["\']([^"\']*)["\']', attrs, re.I)
+        if not cm:
+            continue
+        pairs = []
+        for cls in set(cm.group(1).split()) & set(vp):
+            pairs.extend(vp[cls])
+        if not pairs:
+            continue
+        im = re.search(r'\bid\s*=\s*["\']([^"\']*)["\']', attrs, re.I)
+        if im:
+            vid = im.group(1)  # reuse an existing id (e.g. from pinning)
+        else:
+            vid = "ie6vp-%d" % len(edits)
+            edits.append((m.start(), m.end(), vid))
+        for prop, factor in pairs:  # the script sizes all of its props
+            specs.append((vid, prop, factor))
+    for start, end, vid in sorted(edits, reverse=True):
+        tag = html[start:end]
+        html = html[:start] + tag[:-1] + ' id="%s">' % vid + html[end:]
+    if not specs:
+        return html
+    els = ",".join(
+        '{id:"%s",p:"%s",f:%g}' % (vid, prop, factor) for vid, prop, factor in specs
+    )
+    script = VP_SCRIPT % {"els": els}
+    if re.search(r"</body\s*>", html, re.I):
+        html = re.sub(r"</body\s*>", script + r"</body>", html, count=1, flags=re.I)
+    else:
+        html += script
+    return html
+
+
 def _make_tls_context():
     """Self-signed cert via the openssl CLI, cached in a temp dir."""
     d = os.path.join(tempfile.gettempdir(), "ie6proxy-tls")
@@ -1139,11 +1230,14 @@ class Handler(BaseHTTPRequestHandler):
             flex_classes = set()
             widths = {}
             pinned = set()
+            vp = {}
             for sm in re.finditer(r"<style\b[^>]*>(.*?)</style\s*>",
                                   text, re.I | re.S):
                 flex_classes |= _flex_container_classes(sm.group(1))
                 widths.update(_fixed_px_widths(sm.group(1)))
                 pinned |= _pinned_classes(sm.group(1))
+                for k, v in _viewport_classes(sm.group(1)).items():
+                    vp.setdefault(k, []).extend(v)
             for lm in re.finditer(r"<link\b[^>]*>", text, re.I):
                 tag = lm.group(0)
                 if not re.search(r'rel\s*=\s*["\']?stylesheet', tag, re.I):
@@ -1161,9 +1255,12 @@ class Handler(BaseHTTPRequestHandler):
                     flex_classes |= _flex_container_classes(scss)
                     widths.update(_fixed_px_widths(scss))
                     pinned |= _pinned_classes(scss)
+                    for k, v in _viewport_classes(scss).items():
+                        vp.setdefault(k, []).extend(v)
             text = transform_html(text, url, abs_base)
             text = _flex_row_layout(text, flex_classes, widths, pinned)
             text = _pin_fixed_elements(text, pinned)
+            text = _viewport_elements(text, vp)
             self._send(text, "text/html", 200, head_only)
             return
         if ctype == "text/css":

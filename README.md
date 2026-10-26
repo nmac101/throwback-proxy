@@ -55,7 +55,7 @@ Without `openssl`, `http://` sites still work but `https://` ones fail.
   - `opacity: 0–1` → `alpha(opacity=0–100)`.
   - Existing IE `progid:` filters are passed through untouched.
 - `rgba()`/`hsl()` → `rgb()`.
-- `calc()` evaluated when possible; `vw`/`vh` approximated as px (assuming a 1024×768 screen).
+- `calc()` evaluated when possible; `vw`/`vh` approximated as px (assuming a 1024×768 screen) in the CSS, and elements sized in `vw`/`vh` additionally get a JS resize handler so they track the real window size (padding subtracted to approximate `box-sizing: border-box`).
 - Unsupported properties (`border-radius`, `transform`, `transition`, `animation`, ...) and selectors (`:not()`, `:nth-*`, `:is()`, `:where()`, `:has()`, ...) removed.
 - `::pseudo` → `:pseudo`; all `url()` references rewritten through the proxy.
 
