@@ -656,6 +656,52 @@ def _flatten_css(css):
     return "\n".join(out)
 
 
+def _collect_vars(css):
+    """Return (root_vars, other_vars): custom-property definitions from
+    :root rules and from all other rules, respectively.  Walking the rules
+    (through @media nesting) lets us tell the default theme apart from
+    theme-specific overrides."""
+    root_vars, other_vars = {}, {}
+
+    def walk(i, n):
+        while i < n:
+            c = css[i]
+            if c in " \t\r\n;":
+                i += 1
+                continue
+            if c == "}":
+                i += 1
+                continue
+            brace = css.find("{", i)
+            if brace == -1:
+                break
+            semi = css.find(";", i)
+            if semi != -1 and semi < brace:  # statement at-rule (@import)
+                i = semi + 1
+                continue
+            sel = css[i:brace].strip()
+            depth, j = 0, brace
+            while j < n:
+                if css[j] == "{":
+                    depth += 1
+                elif css[j] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            body = css[brace + 1:j]
+            if sel.startswith("@"):
+                walk(brace + 1, j)  # recurse into @media etc.
+            else:
+                tgt = root_vars if ":root" in sel else other_vars
+                for vm in re.finditer(r"(--[\w-]+)\s*:\s*([^;{}]+)", body):
+                    tgt[vm.group(1)] = vm.group(2).strip()
+            i = j + 1
+
+    walk(0, len(css))
+    return root_vars, other_vars
+
+
 def _resolve_vars(css):
     """Substitute var(--name[, fallback]) using --name definitions from
     :root and from the same rule, then drop the custom-property
@@ -663,10 +709,13 @@ def _resolve_vars(css):
     (IE6 would ignore the declaration anyway)."""
     # Custom properties inherit in CSS; the common pattern is defining them
     # on a component's root rule and using them in nested rules, so pool
-    # every definition in the sheet (later rules win, cascade-ish).
-    sheet_vars = {}
-    for dm in re.finditer(r"(--[\w-]+)\s*:\s*([^;{}]+)", css):
-        sheet_vars[dm.group(1)] = dm.group(2).strip()
+    # every definition in the sheet.  :root (the default/light theme) wins
+    # over theme-specific rules that usually follow it (e.g. a dark theme on
+    # html.skin-theme-clientpref-night or under prefers-color-scheme:dark),
+    # which would otherwise clobber the default values.
+    root_vars, other_vars = _collect_vars(css)
+    sheet_vars = dict(other_vars)
+    sheet_vars.update(root_vars)
 
     def sub(text, local):
         env = dict(sheet_vars)
