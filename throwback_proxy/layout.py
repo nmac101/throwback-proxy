@@ -30,7 +30,8 @@ def _flex_container_classes(css):
 
 
 _FLEX_ROW_CHILD_TAGS = set(
-    "div section article aside nav main header footer ul ol table form fieldset".split()
+    "div section article aside nav main header footer ul ol li table form "
+    "fieldset a span".split()
 )
 _VOID_TAGS = set(
     "area base br col embed hr img input link meta param source track wbr".split()
@@ -134,8 +135,10 @@ def _fixed_px_widths(css):
         w = int(wm.group(1)) + hpad(body)
         if not 40 <= w <= 700:
             continue
-        for cm in re.finditer(r"\.([A-Za-z_][\w-]*)", sel):
-            widths.setdefault(cm.group(1), w)
+        for part in sel.split(","):
+            cm = list(re.finditer(r"\.([A-Za-z_][\w-]*)", part))
+            if cm:
+                widths.setdefault(cm[-1].group(1), w)
     return widths
 
 
@@ -148,8 +151,10 @@ def _pinned_classes(css):
         if not re.search(r"(?<![-\w])position\s*:\s*(?:sticky|fixed)",
                          rm.group(2), re.I):
             continue
-        for cm in re.finditer(r"\.([A-Za-z_][\w-]*)", rm.group(1)):
-            pinned.add(cm.group(1))
+        for part in rm.group(1).split(","):
+            cm = list(re.finditer(r"\.([A-Za-z_][\w-]*)", part))
+            if cm:
+                pinned.add(cm[-1].group(1))
     return pinned
 
 
@@ -169,6 +174,27 @@ def _full_width_classes(css):
             if cm:
                 names.add(cm[-1].group(1))
     return names
+
+
+def _row_container_widths(css):
+    """class name -> fixed pixel width (any size, 40..2000px) from simple
+    class rules.  Unlike _fixed_px_widths (capped at 700px, for sidebar
+    columns) this captures full-width row containers, so an equal-width
+    (flex:1) row can be sized to fill its container in IE6."""
+    widths = {}
+    for rm in re.finditer(r"([^{}]+)\{([^{}]*)\}", css):
+        sel, body = rm.group(1), rm.group(2)
+        wm = re.search(r"(?<![\w-])width\s*:\s*(\d+)px", body, re.I)
+        if not wm:
+            continue
+        w = int(wm.group(1))
+        if not 40 <= w <= 2000:
+            continue
+        for part in sel.split(","):
+            cm = list(re.finditer(r"\.([A-Za-z_][\w-]*)", part))
+            if cm:
+                widths.setdefault(cm[-1].group(1), w)
+    return widths
 
 
 def _flex_sibling_floats(html, flex_classes, full_width=None):
@@ -303,7 +329,8 @@ def _apply_style_edits(html, edits):
     return html
 
 
-def _flex_row_layout(html, flex_classes, widths, pinned=None, full_width=None):
+def _flex_row_layout(html, flex_classes, widths, pinned=None,
+                     full_width=None, row_widths=None):
     """IE6 has no flexbox. For each row-flex container element found in the
     HTML: children with a known fixed pixel width (e.g. a fixed-width sidebar)
     float:left (height:auto so the float box wraps all their content); their
@@ -312,12 +339,15 @@ def _flex_row_layout(html, flex_classes, widths, pinned=None, full_width=None):
     IE6. If such a child is also position:sticky/fixed (pinned), it becomes
     position:absolute instead (floats can't stay put while scrolling; the
     JS pin script keeps them in place) and its siblings get
-    margin-left equal to its outer width. If no child has a known width, fall
-    back to making all of them inline-block."""
+    margin-left equal to its outer width. If no child has a known width, the
+    row is equal-width (flex:1): if the container has a known fixed width the
+    children are sized to fill it evenly, otherwise they float:left at their
+    natural width."""
     if not flex_classes:
         return html
     pinned = pinned or set()
     full_width = full_width or set()
+    row_widths = row_widths or {}
     edits = []  # (open_start, open_end, css-to-append)
     for m in re.finditer(r"<([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)>", html):
         attrs = m.group(2) or ""
@@ -360,6 +390,15 @@ def _flex_row_layout(html, flex_classes, widths, pinned=None, full_width=None):
             None,
         )
         all_float = not has_floated and pinned_w is None
+        # Equal-width (flex:1) row: if the container has a known fixed width,
+        # size each child to fill it evenly -- IE6 has no flex:1, so without
+        # this the row of links hugs the left at its natural (content) width.
+        ew = None
+        if all_float:
+            for k in cm.group(1).split():
+                if k in row_widths:
+                    ew = row_widths[k] // len(children)
+                    break
         for cs, ce, cclasses, cd in children:
             if cd:  # keep explicit inline display untouched
                 continue
@@ -371,6 +410,8 @@ def _flex_row_layout(html, flex_classes, widths, pinned=None, full_width=None):
                 add = "margin-left:%dpx;" % pinned_w
             elif has_floated:
                 add = "overflow:hidden;"
+            elif ew:
+                add = "float:left;width:%dpx;" % ew
             else:
                 # No child has a known width: float them left so the row's
                 # block-level items flow horizontally (display:inline would
@@ -630,9 +671,11 @@ def _viewport_classes(css):
             )
             if not pm:
                 continue
-            for cm in re.finditer(r"\.([A-Za-z_][\w-]*)", rm.group(1)):
-                vp.setdefault(cm.group(1), []).append(
-                    (prop, float(pm.group(1)) / 100.0)
+            for part in rm.group(1).split(","):
+                cm = list(re.finditer(r"\.([A-Za-z_][\w-]*)", part))
+                if cm:
+                    vp.setdefault(cm[-1].group(1), []).append(
+                        (prop, float(pm.group(1)) / 100.0)
                 )
     return vp
 

@@ -531,16 +531,24 @@ def _transform_decls(body):
             fixed = True
         decls.append("%s: %s" % (prop.strip(), v))
     # IE6 ignores max-width, and margin:auto only centres a block that has
-    # an explicit width -- so the ubiquitous "max-width + margin:auto"
-    # centring idiom (very common on <body>) becomes a plain fixed width.
+    # an explicit width AND hasLayout.  Two consequences for the ubiquitous
+    # "max-width + margin:auto" centring idiom (very common on <body> and on
+    # fixed-width page columns): (1) max-width becomes a plain fixed width,
+    # and (2) a fixed width alone still does not give IE6 hasLayout, so the
+    # auto margins silently fail to centre and the column hugs the left --
+    # zoom:1 is the invisible, side-effect-free hasLayout trigger that makes
+    # them work.
+    auto_center = re.search(
+        r"(?<![\w-])margin(?:-left|-right)?\s*:\s*[^;]*\bauto\b", body, re.I)
     mw = re.search(r"(?<![\w-])max-width\s*:\s*([^;]+)", body, re.I)
-    if mw and not re.search(r"(?<![\w-])width\s*:\s*", body, re.I) \
-            and re.search(
-                r"(?<![\w-])margin(?:-left|-right)?\s*:\s*[^;]*\bauto\b",
-                body, re.I):
-        decls = [d for d in decls
-                 if not re.match(r"\s*max-width\s*:", d, re.I)]
-        decls.append("width: %s" % mw.group(1).strip())
+    has_width = re.search(r"(?<![\w-])width\s*:\s*", body, re.I)
+    if auto_center and (mw or has_width):
+        if mw and not has_width:
+            decls = [d for d in decls
+                     if not re.match(r"\s*max-width\s*:", d, re.I)]
+            decls.append("width: %s" % mw.group(1).strip())
+        if not re.search(r"(?<![\w-])zoom\s*:", body, re.I):
+            decls.append("zoom: 1")
     # No extra work for fixed/sticky here: the element is absolute with its
     # static top/left kept, and the HTML step (_pin_fixed_elements) adds a
     # JS scroll handler.  CSS expression() -- the classic IE6 "position:

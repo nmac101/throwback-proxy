@@ -27,8 +27,8 @@ from .layout import (_apply_style_edits, _bg_image_classes,
                      _float_classes, _fixed_px_widths,
                      _grid_column_classes, _grid_row_layout,
                      _margin_auto_classes, _pin_fixed_elements,
-                     _pinned_classes, _viewport_classes,
-                     _viewport_elements)
+                     _pinned_classes, _row_container_widths,
+                     _viewport_classes, _viewport_elements)
 from .urls import from_proxy, to_proxy
 
 
@@ -301,6 +301,7 @@ class Handler(BaseHTTPRequestHandler):
             bottom = set()
             float_classes = set()
             full_width = set()
+            row_widths = {}
             body_filter = None
             css_chunks = []
             for sm in re.finditer(r"<style\b[^>]*>(.*?)</style\s*>",
@@ -323,6 +324,7 @@ class Handler(BaseHTTPRequestHandler):
                 bottom |= _margin_auto_classes(sm.group(1))
                 float_classes |= _float_classes(sm.group(1))
                 full_width |= _full_width_classes(sm.group(1))
+                row_widths.update(_row_container_widths(sm.group(1)))
                 body_filter = body_filter or _body_gradient_filter(sm.group(1))
             for lm in re.finditer(r"<link\b[^>]*>", text, re.I):
                 tag = lm.group(0)
@@ -354,6 +356,7 @@ class Handler(BaseHTTPRequestHandler):
                     bottom |= _margin_auto_classes(scss)
                     float_classes |= _float_classes(scss)
                     full_width |= _full_width_classes(scss)
+                    row_widths.update(_row_container_widths(scss))
                     body_filter = body_filter or _body_gradient_filter(scss)
             text = transform_html(text, url, abs_base)
 
@@ -385,7 +388,7 @@ class Handler(BaseHTTPRequestHandler):
                     r"(<body\b[^>]*>)", r"\1" + bgdiv, text, count=1, flags=re.I
                 )
             text = _flex_row_layout(text, flex_classes, widths, pinned,
-                                    full_width)
+                                    full_width, row_widths)
             text = _grid_row_layout(text, grid_containers, grid_areas)
             text = _apply_style_edits(text, _clearfix_floated_parents(
                 text, float_classes))
