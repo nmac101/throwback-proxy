@@ -52,6 +52,7 @@ Without `openssl`, `http://` sites still work but `https://` ones fail.
 - **Modern effects are approximated with IE6's DXImageTransform filters** rather than just dropped:
   - `linear-gradient()` / `radial-gradient()` → `DXImageTransform.Microsoft.Gradient` (end colors + nearest cardinal direction), with the first stop kept as a solid `background-color` fallback.
   - `box-shadow` / `text-shadow` → `DXImageTransform.Microsoft.DropShadow` (first shadow only; `inset` dropped).
+  - All filter colors are emitted as 8-digit `#AARRGGBB` — the DXImageTransform filters silently fail on 6-digit `#RRGGBB`.
   - `opacity: 0–1` → `alpha(opacity=0–100)`.
   - Existing IE `progid:` filters are passed through untouched.
 - `rgba()`/`hsl()` → `rgb()`.

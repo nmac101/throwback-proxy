@@ -234,24 +234,46 @@ _NAMED_COLORS = {
 }
 
 
-def _to_hex(color):
+def _parse_color(color):
+    """Color -> (rrggbb, aa) lowercase hex pairs, or None."""
     c = color.strip().lower()
     if c in _NAMED_COLORS:
-        return _NAMED_COLORS[c]
-    m = re.match(r"rgba?\(\s*(\d+),\s*(\d+),\s*(\d+)\s*(?:[,/]\s*[\d.]+%?)?\s*\)$", c)
+        return _NAMED_COLORS[c][1:], "ff"
+    m = re.match(r"rgba?\(\s*(\d+),\s*(\d+),\s*(\d+)\s*(?:[,/]\s*([\d.]+%?)?)?\s*\)$", c)
     if m:
-        return "#%02x%02x%02x" % tuple(min(255, int(x)) for x in m.groups())
-    m = re.fullmatch(r"#([0-9a-f]{6})[0-9a-f]{2}", c)  # #rrggbbaa -> drop alpha
+        rrggbb = "%02x%02x%02x" % tuple(min(255, int(x)) for x in m.groups()[:3])
+        a = m.group(4)
+        if a is None:
+            aa = "ff"
+        else:
+            av = float(a.rstrip("%"))
+            av = av / 100.0 if a.endswith("%") else av
+            aa = "%02x" % round(av * 255)
+        return rrggbb, aa
+    m = re.fullmatch(r"#([0-9a-f]{6})([0-9a-f]{2})", c)  # #rrggbbaa
     if m:
-        return "#" + m.group(1)
+        return m.group(1), m.group(2)
     if re.fullmatch(r"#[0-9a-f]{6}", c):
-        return c
-    m = re.fullmatch(r"#([0-9a-f]{3})[0-9a-f]", c)  # #rgba -> drop alpha
+        return c[1:], "ff"
+    m = re.fullmatch(r"#([0-9a-f]{3})([0-9a-f])", c)  # #rgba
     if m:
-        return "#" + "".join(ch * 2 for ch in m.group(1))
+        return "".join(ch * 2 for ch in m.group(1)), m.group(2) * 2
     if re.fullmatch(r"#[0-9a-f]{3}", c):
-        return "#" + "".join(ch * 2 for ch in c[1:])
+        return "".join(ch * 2 for ch in c[1:]), "ff"
     return None
+
+
+def _to_hex(color):
+    """Color -> #rrggbb (alpha dropped); for CSS properties."""
+    p = _parse_color(color)
+    return "#" + p[0] if p else None
+
+
+def _to_argb(color):
+    """Color -> #aarrggbb; the DXImageTransform filters (Gradient,
+    DropShadow, Shadow) silently fail on 6-digit #rrggbb strings."""
+    p = _parse_color(color)
+    return "#" + p[1] + p[0] if p else None
 
 
 def _px(value):
@@ -305,7 +327,7 @@ def _gradient_filter(value):
         start, end = (first, last) if angle == 180 else (last, first)
     filt = (
         "progid:DXImageTransform.Microsoft.Gradient(GradientType=%d,"
-        " StartColorStr='%s', EndColorStr='%s')" % (gtype, _to_hex(start), _to_hex(end))
+        " StartColorStr='%s', EndColorStr='%s')" % (gtype, _to_argb(start), _to_argb(end))
     )
     return filt, first
 
@@ -319,11 +341,13 @@ def _shadow_filter(value):
     """
     if "inset" in value.lower():
         return None
-    lengths = re.findall(r"-?[\d.]+(?:px|em)", value)
+    # strip color tokens first so hex digits aren't read as lengths;
+    # offsets are often unitless ("0 0 10px #000")
+    lengths = re.findall(r"-?[\d.]+(?:px|em)?", re.sub(_COLOR_RE, " ", value))
     color_m = re.search(_COLOR_RE, value)
     if len(lengths) < 2 or not color_m:
         return None
-    hexc = _to_hex(color_m.group(1))
+    hexc = _to_argb(color_m.group(1))
     if not hexc:
         return None
     blur = _px(lengths[2]) if len(lengths) > 2 else 0.0
