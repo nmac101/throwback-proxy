@@ -311,6 +311,23 @@ def _gradient_filter(value):
             angle = {"top": 0, "right": 90, "bottom": 180, "left": 270}[am.group(1)]
         else:
             angle = float(am.group(2)) % 360
+    else:
+        # radial-gradient(... at <pos>): the color radiates from <pos>, so
+        # the linear approximation points away from it.
+        pm = re.search(
+            r"\bat\s+((?:top|bottom)\s+(?:left|right)|(?:left|right)\s+"
+            r"(?:top|bottom)|top|bottom|left|right)",
+            inner, re.I,
+        )
+        if pm:
+            pos = re.sub(r"\s+", " ", pm.group(1).lower())
+            angle = {
+                "top": 180, "bottom": 0, "left": 90, "right": 270,
+                "top left": 225, "left top": 225,
+                "top right": 45, "right top": 45,
+                "bottom left": 135, "left bottom": 135,
+                "bottom right": 315, "right bottom": 315,
+            }[pos]
     # snap to nearest cardinal, circularly (350deg -> 0, not 270)
     angle = min(
         (0, 90, 180, 270),
@@ -389,7 +406,14 @@ def _transform_decls(body):
         g = _gradient_filter(v)
         if g:
             filters.append(g[0])
-            if p == "background":  # keep a solid fallback color (hex only)
+            um = re.search(r"url\([^)]*\)", v)
+            if um:
+                # Multi-layer background (e.g. gradient over an image):
+                # keep the image layer; the gradient paints over it as a
+                # filter.  Without this the url() would be dropped and the
+                # element would show only the gradient.
+                decls.append("background-image: %s" % um.group(0))
+            elif p == "background":  # keep a solid fallback color (hex only)
                 hexc = _to_hex(g[1])
                 if hexc:
                     decls.append("background-color: %s" % hexc)
@@ -473,8 +497,15 @@ def transform_css(css, base, abs_base=None):
         css, ["font-face", "keyframes", "-webkit-keyframes", "-moz-keyframes"]
     )
     css = _strip_at_blocks(css, ["media", "supports"])
+    # rgba -> rgb, keeping the alpha as a 4th value: IE6 ignores such
+    # declarations in CSS properties (as before), but _parse_color can
+    # recover the alpha for the DX filters.
     css = re.sub(
-        r"rgba\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)[^)]*\)", r"rgb(\1,\2,\3)", css, re.I
+        r"rgba\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*([\d.]+%?)\s*\)",
+        r"rgb(\1,\2,\3,\4)", css, re.I,
+    )
+    css = re.sub(
+        r"rgba\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)", r"rgb(\1,\2,\3)", css, re.I
     )
 
     def _hsl(m):
