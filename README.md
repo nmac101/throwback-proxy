@@ -29,10 +29,12 @@ your network too. Set the HTTP proxy in your browser/OS internet settings to
 
 In this mode the browser sends absolute-form requests for `http://` sites
 (proxied directly) and `CONNECT host:443` tunnels for `https://` sites.
-The tunnel is terminated with a self-signed certificate generated at startup
-(via the `openssl` CLI), so browsers show a certificate warning once per
-site; after you accept it, the request is downgraded to plain HTTP upstream.
-Without `openssl`, `http://` sites still work but `https://` ones fail.
+Any `https://` request (absolute-form or over a `CONNECT` tunnel) is
+answered with a **302 redirect to the `http://` version**, so the browser
+reloads over plain HTTP -- no TLS, no self-signed-certificate prompts.
+The `CONNECT` tunnel is still terminated with a self-signed certificate
+generated at startup (via the `openssl` CLI) so the redirect itself can be
+delivered; without `openssl`, `http://` sites work but `https://` ones fail.
 
 ## What it does
 
@@ -73,7 +75,7 @@ Without `openssl`, `http://` sites still work but `https://` ones fail.
 - `image/svg+xml` is converted to PNG on the fly **if ImageMagick is installed** (`magick`/`convert`); IE6 cannot render SVG, otherwise it passes through unchanged.
 
 ### HTTPS downgrade
-All upstream fetches use plain HTTP: a `/https/host/...` link is fetched from `http://host/...`. (Links in rewritten pages still carry their original scheme, so mixed content behaves as it would on the open web.)
+`https://` requests are redirected (302) to their `http://` equivalent, so everything loads over plain HTTP. Upstream fetches always use HTTP: a `/https/host/...` link is fetched from `http://host/...`. (Links in rewritten pages still carry their original scheme, so mixed content behaves as it would on the open web.)
 
 ### Ad blocking
 Requests whose host matches a known ad/tracking domain (doubleclick, googlesyndication, google-analytics, googletagmanager, adnxs, taboola, outbrain, criteo, pubmatic, rubiconproject, ...) are served locally without any upstream request: an empty `204` for scripts/XHR, a transparent 1×1 GIF for image URLs. The list lives in `AD_DOMAINS` in `ie6proxy.py`.

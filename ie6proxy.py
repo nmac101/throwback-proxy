@@ -8,9 +8,9 @@ Usage:
     python3 ie6proxy.py [port]          (default port: 8080)
 
 Then set it as your system/LAN proxy (this machine's IP, port 8080).
-Absolute-form requests are proxied directly, and CONNECT tunnels for
-HTTPS sites are terminated with a self-signed certificate and downgraded
-to HTTP upstream. There are no direct proxy URLs -- the browser must use
+Absolute-form requests are proxied directly, and HTTPS requests
+(absolute-form or over a CONNECT tunnel) are redirected to their HTTP
+equivalent. There are no direct proxy URLs -- the browser must use
 it as its configured proxy.
 
 How it works:
@@ -32,7 +32,7 @@ How it works:
       - image/webp: converted to PNG on the fly (if Pillow is installed).
       - image/svg+xml: converted to PNG on the fly (if ImageMagick is
         installed); IE6 cannot render SVG.
-  * All upstream HTTPS requests are transparently downgraded to HTTP.
+  * HTTPS requests are redirected (302) to their HTTP equivalent.
   * Requests whose host matches a known ad/tracking domain are served an
     empty response (204) or a transparent 1x1 GIF, without touching the
     network at all.
@@ -1653,6 +1653,7 @@ class Handler(BaseHTTPRequestHandler):
         self.rfile = tls.makefile("rb", self.rbufsize)
         self.wfile = tls.makefile("wb")
         self.close_connection = False
+        self._tls = True  # request arrived over a CONNECT tunnel (https)
 
     # -- main ---------------------------------------------------------------
     def _handle(self, head_only):
@@ -1699,6 +1700,17 @@ class Handler(BaseHTTPRequestHandler):
                 404,
                 head_only,
             )
+            return
+
+        # Downgrade HTTPS: redirect the client to the http:// version so it
+        # reloads over plain HTTP (no TLS, no self-signed-cert prompts).  The
+        # request was https if it was absolute-form https:// or arrived over a
+        # CONNECT tunnel (self._tls).
+        if self.path.lower().startswith("https://") \
+                or getattr(self, "_tls", False):
+            loc = url if url.lower().startswith("http://") \
+                else url.replace("https://", "http://", 1)
+            self._redirect(loc)
             return
 
         # Optional ?ie6w=<px> hint (added by the proxy itself when it injects
