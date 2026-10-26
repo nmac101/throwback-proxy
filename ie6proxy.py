@@ -851,7 +851,7 @@ def _pinned_classes(css):
 
 def _flex_row_layout(html, flex_classes, widths, pinned=None):
     """IE6 has no flexbox. For each row-flex container element found in the
-    HTML: children with a known fixed pixel width (e.g. a 225px sidebar) get
+    HTML: children with a known fixed pixel width (e.g. a fixed-width sidebar)
     float:left (height:auto so the float box wraps all their content); their
     siblings get overflow:hidden so they wrap around the float and take the
     remaining width -- the classic pre-flex two-column pattern, rock solid in
@@ -1046,7 +1046,7 @@ VP_SCRIPT = (
 
 def _viewport_classes(css):
     """Class names whose rules use vw/vh lengths, mapped to the (property,
-    fraction-of-viewport) pairs, e.g. {'sidebar': [('height', 1.0)]}."""
+    fraction-of-viewport) pairs, e.g. {'sidenav': [('height', 1.0)]}."""
     vp = {}
     for rm in re.finditer(r"([^{}]+)\{([^{}]*)\}", css):
         for prop, unit in (("height", "vh"), ("width", "vw")):
