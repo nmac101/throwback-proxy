@@ -1,4 +1,4 @@
-# throwback-proxy
+# Throwback Proxy
 
 An HTTP proxy in pure Python (stdlib only) that rewrites modern web pages so
 they can be rendered by **Internet Explorer 6**, mostly preserving the original
@@ -7,8 +7,22 @@ page structure — and blocks ads on the way.
 ## Run
 
 ```sh
-python3 ie6proxy.py [port]     # default: 8080
+python3 -m throwback_proxy [port]     # default: 8080
 ```
+
+## Layout
+
+| Module | Purpose |
+| --- | --- |
+| `throwback_proxy/config.py` | Global constants (host, port, user agent, ad domains, doctype) |
+| `throwback_proxy/urls.py` | The proxy URL scheme (`to_proxy` / `from_proxy`) |
+| `throwback_proxy/css.py` | CSS rewriting (filters, units, selectors, var()/nesting) |
+| `throwback_proxy/html.py` | HTML rewriting (tag down-conversion, scripts, URLs) |
+| `throwback_proxy/layout.py` | Layout fixes (flex/grid rows, fixed pinning, viewport sizing) |
+| `throwback_proxy/fetch.py` | Upstream HTTP fetching |
+| `throwback_proxy/images.py` | webp/svg → PNG conversion (optional deps) |
+| `throwback_proxy/ads.py` | Ad / tracking domain matching |
+| `throwback_proxy/server.py` | The HTTP proxy server and entry point |
 
 ## Use it as your system / LAN proxy
 
@@ -62,6 +76,7 @@ delivered; without `openssl`, `http://` sites work but `https://` ones fail.
   - `opacity: 0–1` → `alpha(opacity=0–100)`.
   - Existing IE `progid:` filters are passed through untouched.
   - Filters are dropped from `body`/`html` rules: IE6 ignores them there, and a filter on an ancestor breaks the filters of all descendants (which is why page gradients can die when the body has e.g. a text-shadow). A `body` gradient background is repainted on a pinned, full-viewport `z-index:-1` div injected after `<body>` (matching `background-attachment: fixed`).
+- `list-style` shorthand (and `list-style-type: none`) expanded to longhand with an explicit `list-style-image: none`: IE6's shorthand doesn't reset the image, so e.g. MediaWiki Vector's global `ul { list-style-image: url(bullet.svg) }` would otherwise keep bullets on the sidebar/footer/tab lists.
 - `rgba()`/`hsl()` → `rgb()`.
 - `calc()` evaluated when possible; `vw`/`vh` approximated as px (assuming a 1024×768 screen) in the CSS, and elements sized in `vw`/`vh` additionally get a JS resize handler so they track the real window size (padding subtracted to approximate `box-sizing: border-box`).
 - Inline `<style>` blocks get the same treatment as linked stylesheets (sites like example.com keep all their CSS inline).
@@ -79,7 +94,7 @@ delivered; without `openssl`, `http://` sites work but `https://` ones fail.
 `https://` requests are redirected (302) to their `http://` equivalent, so everything loads over plain HTTP. Upstream fetches always use HTTP: a `/https/host/...` link is fetched from `http://host/...`. (Links in rewritten pages still carry their original scheme, so mixed content behaves as it would on the open web.)
 
 ### Ad blocking
-Requests whose host matches a known ad/tracking domain (doubleclick, googlesyndication, google-analytics, googletagmanager, adnxs, taboola, outbrain, criteo, pubmatic, rubiconproject, ...) are served locally without any upstream request: an empty `204` for scripts/XHR, a transparent 1×1 GIF for image URLs. The list lives in `AD_DOMAINS` in `ie6proxy.py`.
+Requests whose host matches a known ad/tracking domain (doubleclick, googlesyndication, google-analytics, googletagmanager, adnxs, taboola, outbrain, criteo, pubmatic, rubiconproject, ...) are served locally without any upstream request: an empty `204` for scripts/XHR, a transparent 1×1 GIF for image URLs. The list lives in `AD_DOMAINS` in `throwback_proxy/config.py`.
 
 ## Caveats
 - Rewriting is regex-based (no full parser): it handles the vast majority of real-world markup but exotic/nested constructs may slip through.
