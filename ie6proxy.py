@@ -1360,11 +1360,17 @@ def _bg_image_elements(html, bg, base, abs_base=None):
         if re.search(r"\bstyle\s*=\s*[\"']", tag_text, re.I):
             tag_text = re.sub(
                 r"(\bstyle\s*=\s*[\"'])([^\"']*)",
-                lambda mm: mm.group(1) + mm.group(2) + "background-image:none;",
+                # the stylesheet background may be !important; inline
+                # !important is the only thing that beats it.  It must lose
+                # because IE6 paints transparent PNG *backgrounds* black --
+                # the injected <img> must be the sole painter.
+                lambda mm: mm.group(1) + mm.group(2) +
+                           "background-image:none !important;",
                 tag_text, count=1, flags=re.I,
             )
         else:
-            tag_text = tag_text[:-1] + ' style="background-image:none;">'
+            tag_text = tag_text[:-1] + \
+                ' style="background-image:none !important;">'
         img = ('<img src="%s" alt="" '
                'style="display:block;%s;border:0">' % (img_url, img_style))
         edits.append((m.start(), m.end(), tag_text + img))
