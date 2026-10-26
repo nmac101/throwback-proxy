@@ -486,9 +486,37 @@ def _filter_rules(css):
         decls = _transform_decls(body)
         if not decls:
             return ""
+        # IE6 ignores filters on body/html -- and worse, a filter on an
+        # ancestor breaks the filters of its descendants, so a body filter
+        # (e.g. from text-shadow) kills every gradient on the page.
+        if re.search(r"(^|,\s*)\s*(body|html)\s*($|,)", sel, re.I):
+            decls = "; ".join(
+                d for d in decls.split(";") if not d.strip().lower().startswith("filter")
+            )
+            if not decls.strip():
+                return ""
         return "%s { %s }" % (sel, decls)
 
     return re.sub(r"([^{}]+)\{([^{}]*)\}", sub, css)
+
+
+def _body_gradient_filter(css):
+    """If the body rule has a gradient background, return the DX gradient
+    filter for it.  IE6 can't put filters on body, so the HTML step paints
+    it on a full-viewport background div instead (matching the original
+    background-attachment:fixed look)."""
+    for rm in re.finditer(r"([^{}]+)\{([^{}]*)\}", css):
+        sel = rm.group(1).strip()
+        if not re.fullmatch(r"(?:body|html)(?:\s*,\s*(?:body|html))*", sel, re.I):
+            continue
+        bm = re.search(
+            r"(?<![\w-])background(?:-image)?\s*:\s*([^;]+)", rm.group(2), re.I
+        )
+        if bm and "gradient" in bm.group(1).lower():
+            g = _gradient_filter(bm.group(1))
+            if g:
+                return g[0]
+    return None
 
 
 def transform_css(css, base, abs_base=None):
@@ -1356,6 +1384,7 @@ class Handler(BaseHTTPRequestHandler):
             pinned = set()
             vp = {}
             bg = {}
+            body_filter = None
             for sm in re.finditer(r"<style\b[^>]*>(.*?)</style\s*>",
                                   text, re.I | re.S):
                 flex_classes |= _flex_container_classes(sm.group(1))
@@ -1364,6 +1393,7 @@ class Handler(BaseHTTPRequestHandler):
                 for k, v in _viewport_classes(sm.group(1)).items():
                     vp.setdefault(k, []).extend(v)
                 bg.update(_bg_image_classes(sm.group(1)))
+                body_filter = body_filter or _body_gradient_filter(sm.group(1))
             for lm in re.finditer(r"<link\b[^>]*>", text, re.I):
                 tag = lm.group(0)
                 if not re.search(r'rel\s*=\s*["\']?stylesheet', tag, re.I):
@@ -1384,8 +1414,25 @@ class Handler(BaseHTTPRequestHandler):
                     for k, v in _viewport_classes(scss).items():
                         vp.setdefault(k, []).extend(v)
                     bg.update(_bg_image_classes(scss))
+                    body_filter = body_filter or _body_gradient_filter(scss)
             text = transform_html(text, url, abs_base)
             text = _bg_image_elements(text, bg, url, abs_base)
+            if body_filter:
+                # IE6 can't filter body: paint the gradient on a pinned,
+                # full-viewport div behind everything (z-index:-1 renders
+                # above the body background color in IE6).
+                pinned.add("ie6bg")
+                vp.setdefault("ie6bg", []).extend(
+                    [("width", 1.0), ("height", 1.0)]
+                )
+                bgdiv = (
+                    '<div class="ie6bg" style="position:absolute;left:0;top:0;'
+                    'width:100%%;height:100%%;z-index:-1;filter:%s"></div>'
+                    % body_filter
+                )
+                text = re.sub(
+                    r"(<body\b[^>]*>)", r"\1" + bgdiv, text, count=1, flags=re.I
+                )
             text = _flex_row_layout(text, flex_classes, widths, pinned)
             text = _pin_fixed_elements(text, pinned)
             text = _viewport_elements(text, vp)

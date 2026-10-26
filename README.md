@@ -57,6 +57,7 @@ Without `openssl`, `http://` sites still work but `https://` ones fail.
   - All filter colors are emitted as 8-digit `#AARRGGBB` — the DXImageTransform filters silently fail on 6-digit `#RRGGBB`.
   - `opacity: 0–1` → `alpha(opacity=0–100)`.
   - Existing IE `progid:` filters are passed through untouched.
+  - Filters are dropped from `body`/`html` rules: IE6 ignores them there, and a filter on an ancestor breaks the filters of all descendants (which is why page gradients can die when the body has e.g. a text-shadow). A `body` gradient background is repainted on a pinned, full-viewport `z-index:-1` div injected after `<body>` (matching `background-attachment: fixed`).
 - `rgba()`/`hsl()` → `rgb()`.
 - `calc()` evaluated when possible; `vw`/`vh` approximated as px (assuming a 1024×768 screen) in the CSS, and elements sized in `vw`/`vh` additionally get a JS resize handler so they track the real window size (padding subtracted to approximate `box-sizing: border-box`).
 - Unsupported properties (`border-radius`, `transform`, `transition`, `animation`, ...) and selectors (`:not()`, `:nth-*`, `:is()`, `:where()`, `:has()`, ...) removed.
