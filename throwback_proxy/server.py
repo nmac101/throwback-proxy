@@ -7,6 +7,8 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import traceback
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler
 from html import unescape as html_unescape
 from urllib.parse import urljoin, urlparse
@@ -15,11 +17,11 @@ from .ads import _is_ad_url
 from .config import (DEFAULT_PORT, FIX_IE_CSS_LIMIT_JS,
                      FIX_IE_CSS_LIMIT_PATH, HOST, TRANSPARENT_GIF,
                      XHTML_STRICT_DOCTYPE)
-from .css import _body_gradient_filter, transform_css
-from .fetch import http_get
+from .css import _body_gradient_filter, _resolve_media, transform_css
+from .fetch import http_get, http_get_cached
 from .html import transform_html
-from .images import _svg_to_png, _webp_to_png
-from .layout import (_apply_style_edits, _bg_image_classes,
+from .images import _ie6_png, _svg_to_png, _webp_to_png
+from .layout import (FlexClasses, _apply_style_edits, _bg_image_classes,
                      _bg_image_elements, _bottom_pin_elements,
                      _clearfix_floated_parents, _container_metrics,
                      _flex_container_classes, _flex_row_layout,
@@ -29,6 +31,7 @@ from .layout import (_apply_style_edits, _bg_image_classes,
                      _margin_auto_classes, _pin_fixed_elements,
                      _pinned_classes, _row_container_widths,
                      _viewport_classes, _viewport_elements)
+from .selectors import apply_synthetic_classes
 from .urls import from_proxy, to_proxy
 
 
@@ -91,7 +94,73 @@ downgraded to HTTP, and ads are blocked.
 """
 
 
+class _CssHints:
+    """Layout hints gathered from a page's <style> blocks and linked
+    stylesheets (see layout.py for how each one is used)."""
+
+    def __init__(self):
+        self.flex_classes = FlexClasses()
+        self.widths = {}
+        self.grid_containers = {}
+        self.grid_areas = {}
+        self.pinned = set()
+        self.vp = {}
+        self.bg = {}
+        self.bottom = set()
+        self.float_classes = set()
+        self.full_width = set()
+        self.row_widths = {}
+        self.body_filter = None
+        self.css_chunks = []
+        self.synth = {}  # synthetic-class specs (see selectors.py)
+
+    def scan(self, css, base, abs_base):
+        # only the rules that apply at the assumed viewport are hints
+        css = _resolve_media(re.sub(r"/\*.*?\*/", "", css, flags=re.S))
+        self.css_chunks.append(css)
+        self.flex_classes.merge(_flex_container_classes(css))
+        self.widths.update(_fixed_px_widths(css))
+        gc, ga = _grid_column_classes(css)
+        for k, v in gc.items():
+            self.grid_containers.setdefault(k, v)
+        for k, v in ga.items():
+            self.grid_areas.setdefault(k, set()).update(v)
+        self.pinned |= _pinned_classes(css)
+        for k, v in _viewport_classes(css).items():
+            self.vp.setdefault(k, []).extend(v)
+        # on the TRANSFORMED css: the image url may live in a var() that
+        # only flattening/resolution exposes
+        self.bg.update(_bg_image_classes(
+            transform_css(css, base, abs_base, self.synth)))
+        self.bottom |= _margin_auto_classes(css)
+        self.float_classes |= _float_classes(css)
+        self.full_width |= _full_width_classes(css)
+        self.row_widths.update(_row_container_widths(css))
+        self.body_filter = self.body_filter or _body_gradient_filter(css)
+
+
+def _decode(body, declared):
+    """Decode a response body.  *declared* is the charset from the
+    Content-Type header (or None); fall back to a <meta> declaration in the
+    first bytes, then UTF-8.  Unknown charset names never raise."""
+    cands = []
+    if declared:
+        cands.append(declared)
+    m = re.search(rb"""charset\s*=\s*["']?([\w-]+)""", body[:2048], re.I)
+    if m:
+        cands.append(m.group(1).decode("ascii"))
+    cands.append("utf-8")
+    for c in cands:
+        try:
+            return body.decode(c, errors="replace")
+        except LookupError:
+            continue
+
+
 class Handler(BaseHTTPRequestHandler):
+    # Keep-alive: IE6 fires dozens of requests per page, and every response
+    # this handler sends carries a Content-Length.
+    protocol_version = "HTTP/1.1"
     server_version = "ThrowbackProxy/1.0"
 
     def log_message(self, fmt, *args):
@@ -139,7 +208,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header(k, v)
         self.end_headers()
         if not head_only:
-            self.wfile.write(body)
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                self.close_connection = True  # client went away mid-body
 
     def _redirect(self, location):
         self.send_response(302)
@@ -148,11 +220,27 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     # -- verbs --------------------------------------------------------------
+    def _safe_handle(self, head_only):
+        # A rewriter bug must not drop the connection with a bare traceback:
+        # log it and tell the browser what happened.
+        try:
+            self._handle(head_only)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+        except Exception:
+            traceback.print_exc()
+            try:
+                self._send(b"Throwback Proxy: internal error while "
+                           b"rewriting this page.", "text/plain", 500,
+                           head_only)
+            except OSError:
+                self.close_connection = True
+
     def do_GET(self):
-        self._handle(head_only=False)
+        self._safe_handle(head_only=False)
 
     def do_HEAD(self):
-        self._handle(head_only=True)
+        self._safe_handle(head_only=True)
 
     def do_POST(self):
         self._send("<html><body>POST is not proxied by Throwback Proxy.</body></html>",
@@ -269,8 +357,7 @@ class Handler(BaseHTTPRequestHandler):
         if _is_ad_url(url):
             p = urlparse(url)
             if re.search(r"\.(gif|png|jpe?g|webp|svg)$", p.path, re.I):
-                self._send(TRANSPARENT_GIF, "image/gif", 204 if head_only else 200,
-                           head_only)
+                self._send(TRANSPARENT_GIF, "image/gif", 200, head_only)
             else:
                 self._send(b"", "text/plain", 204, head_only)
             return
@@ -292,48 +379,23 @@ class Handler(BaseHTTPRequestHandler):
             return
         ctype = headers.get("Content-Type", "application/octet-stream").split(";")[0].strip()
         charset_m = re.search(r"charset=([\w-]+)", headers.get("Content-Type") or "", re.I)
-        charset = charset_m.group(1).lower() if charset_m else "utf-8"
+        charset = charset_m.group(1).lower() if charset_m else None
+        extra = {}
+        if headers.get("Content-Disposition"):
+            extra["Content-Disposition"] = headers["Content-Disposition"]
 
         # --- transform by type ---
-        if ctype == "text/html":
-            text = body.decode(charset, errors="replace")
+        # IE6 can't render application/xhtml+xml (it offers a download); the
+        # markup is served as text/html instead.
+        if ctype in ("text/html", "application/xhtml+xml"):
+            text = _decode(body, charset)
             # Find row-flex containers (from <style> blocks and linked
             # stylesheets) so their children can be laid out side by side.
-            flex_classes = set()
-            widths = {}
-            grid_containers = {}
-            grid_areas = {}
-            pinned = set()
-            vp = {}
-            bg = {}
-            bottom = set()
-            float_classes = set()
-            full_width = set()
-            row_widths = {}
-            body_filter = None
-            css_chunks = []
+            hints = _CssHints()
             for sm in re.finditer(r"<style\b[^>]*>(.*?)</style\s*>",
                                   text, re.I | re.S):
-                css_chunks.append(sm.group(1))
-                flex_classes |= _flex_container_classes(sm.group(1))
-                widths.update(_fixed_px_widths(sm.group(1)))
-                gc, ga = _grid_column_classes(sm.group(1))
-                for k, v in gc.items():
-                    grid_containers.setdefault(k, v)
-                for k, v in ga.items():
-                    grid_areas.setdefault(k, set()).update(v)
-                pinned |= _pinned_classes(sm.group(1))
-                for k, v in _viewport_classes(sm.group(1)).items():
-                    vp.setdefault(k, []).extend(v)
-                # on the TRANSFORMED css: the image url may live in a
-                # var() that only flattening/resolution exposes
-                bg.update(_bg_image_classes(
-                    transform_css(sm.group(1), url, abs_base)))
-                bottom |= _margin_auto_classes(sm.group(1))
-                float_classes |= _float_classes(sm.group(1))
-                full_width |= _full_width_classes(sm.group(1))
-                row_widths.update(_row_container_widths(sm.group(1)))
-                body_filter = body_filter or _body_gradient_filter(sm.group(1))
+                hints.scan(sm.group(1), url, abs_base)
+            sheets = []
             for lm in re.finditer(r"<link\b[^>]*>", text, re.I):
                 tag = lm.group(0)
                 if not re.search(r'rel\s*=\s*["\']?stylesheet', tag, re.I):
@@ -343,29 +405,25 @@ class Handler(BaseHTTPRequestHandler):
                     continue
                 su = re.sub(r"^https://", "http://",
                             urljoin(url, html_unescape(hm.group(1))))
-                if _is_ad_url(su):
-                    continue
-                _, _, sdata = http_get(su, timeout=5)
-                if sdata:
-                    scss = sdata.decode("utf-8", "replace")
-                    css_chunks.append(scss)
-                    flex_classes |= _flex_container_classes(scss)
-                    widths.update(_fixed_px_widths(scss))
-                    gc, ga = _grid_column_classes(scss)
-                    for k, v in gc.items():
-                        grid_containers.setdefault(k, v)
-                    for k, v in ga.items():
-                        grid_areas.setdefault(k, set()).update(v)
-                    pinned |= _pinned_classes(scss)
-                    for k, v in _viewport_classes(scss).items():
-                        vp.setdefault(k, []).extend(v)
-                    bg.update(_bg_image_classes(
-                        transform_css(scss, su, abs_base)))
-                    bottom |= _margin_auto_classes(scss)
-                    float_classes |= _float_classes(scss)
-                    full_width |= _full_width_classes(scss)
-                    row_widths.update(_row_container_widths(scss))
-                    body_filter = body_filter or _body_gradient_filter(scss)
+                if not _is_ad_url(su):
+                    sheets.append(su)
+            # fetched concurrently: a page can link dozens of stylesheets
+            if sheets:
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    fetched = list(pool.map(
+                        lambda u: http_get_cached(u, timeout=5)[2], sheets))
+                for su, sdata in zip(sheets, fetched):
+                    if sdata:
+                        hints.scan(_decode(sdata, None), su, abs_base)
+            flex_classes, widths = hints.flex_classes, hints.widths
+            grid_containers, grid_areas = hints.grid_containers, hints.grid_areas
+            pinned, vp, bg = hints.pinned, hints.vp, hints.bg
+            bottom, float_classes = hints.bottom, hints.float_classes
+            full_width, row_widths = hints.full_width, hints.row_widths
+            body_filter, css_chunks = hints.body_filter, hints.css_chunks
+            # on the original markup: attribute selectors must see the
+            # page's own tag names and attribute values
+            text = apply_synthetic_classes(text, hints.synth)
             text = transform_html(text, url, abs_base)
 
             def _style_block(m):
@@ -405,23 +463,27 @@ class Handler(BaseHTTPRequestHandler):
             text = _bottom_pin_elements(
                 text, bottom, pinned,
                 _container_metrics("\n".join(css_chunks), pinned))
-            self._send(text, "text/html", 200, head_only)
+            self._send(text, "text/html", status, head_only, extra)
             return
         if ctype == "text/css":
-            text = body.decode(charset, errors="replace")
-            text = transform_css(text, url, abs_base)
-            self._send(text, "text/css", 200, head_only)
+            text = transform_css(_decode(body, charset), url, abs_base)
+            self._send(text, "text/css", status, head_only, extra)
             return
-        if ctype == "image/webp" and _webp_to_png:
-            body = _webp_to_png(body)
-            ctype = "image/png"
+        converted = False
+        if ctype in ("image/webp", "image/avif") and _webp_to_png:
+            png = _webp_to_png(body)
+            if png:
+                body, ctype, converted = png, "image/png", True
         if (ctype == "image/svg+xml" or url.lower().endswith(".svg")) \
                 and _svg_to_png:
             png = _svg_to_png(body, svg_width)
             if png:
                 body, ctype = png, "image/png"
+        if ctype == "image/png" and _ie6_png and not converted:
+            # 32-bit alpha PNGs render with gray/black backgrounds in IE6
+            body = _ie6_png(body) or body
 
-        self._send(body, ctype, 200, head_only)
+        self._send(body, ctype, status, head_only, extra)
 
 
 def main():

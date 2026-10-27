@@ -8,6 +8,8 @@ import colorsys
 import re
 from urllib.parse import urljoin
 
+from .config import VIEWPORT_HEIGHT, VIEWPORT_WIDTH
+from .selectors import rewrite_selector
 from .urls import to_proxy
 
 def _balanced_paren(s, i):
@@ -86,23 +88,124 @@ def _strip_simple_nots(sel):
             return out
 
 
-def _unwrap_plain_media(css):
-    """Unwrap always-true @media blocks (e.g. `@media screen`, `@media all`).
+def _length_px(v):
+    m = re.fullmatch(r"\s*(-?[\d.]+)\s*(px|em|rem)?\s*", v)
+    if not m:
+        return None
+    n = float(m.group(1))
+    return n * 16 if m.group(2) in ("em", "rem") else n
 
-    Some sites (MediaWiki Vector 2022 in particular) wrap their core styles in
-    a plain `@media screen { ... }` block.  IE6 knows no @media, and the
-    generic strip below would delete the whole block along with the layout.
-    Unwrap blocks whose condition is just `screen`/`all` with no `and`.
-    """
-    pat = re.compile(r"@media\s+(?:screen|all)\s*\{", re.I)
+
+def _feature_true(feat):
+    """Evaluate one parenthesised media feature for the assumed viewport."""
+    f = feat.strip()
+    if f.lower().startswith("not "):
+        return not _feature_true(f[4:].strip().strip("()"))
+    dims = {"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT,
+            "device-width": VIEWPORT_WIDTH, "device-height": VIEWPORT_HEIGHT}
+    if ":" in f:
+        name, _, val = f.partition(":")
+        name, val = name.strip().lower(), val.strip().lower()
+        m = re.fullmatch(r"(min|max)-(.+)", name)
+        kind, base = (m.group(1), m.group(2)) if m else (None, name)
+        base = base.replace("-webkit-", "").replace("-moz-", "")
+        if base in dims:
+            px = _length_px(val)
+            if px is None:
+                return False
+            return (dims[base] >= px if kind == "min"
+                    else dims[base] <= px if kind == "max"
+                    else dims[base] == px)
+        if base in ("resolution", "device-pixel-ratio"):
+            rm = re.fullmatch(r"([\d.]+)\s*(dppx|dpi|x)?", val)
+            if not rm:
+                return False
+            n = float(rm.group(1))
+            if rm.group(2) == "dpi":
+                n /= 96.0
+            return (1 >= n if kind == "min" else 1 <= n if kind == "max"
+                    else n == 1)
+        table = {
+            ("orientation", "landscape"): True,
+            ("hover", "hover"): True, ("any-hover", "hover"): True,
+            ("pointer", "fine"): True, ("any-pointer", "fine"): True,
+            ("prefers-color-scheme", "light"): True,
+            ("prefers-reduced-motion", "no-preference"): True,
+            ("prefers-contrast", "no-preference"): True,
+            ("prefers-reduced-transparency", "no-preference"): True,
+            ("display-mode", "browser"): True,
+            ("update", "fast"): True, ("scripting", "none"): True,
+        }
+        return table.get((name, val), False)
+    # range syntax: (width >= 1120px), (400px <= width <= 800px)
+    parts = re.split(r"\s*(<=|>=|<|>|=)\s*", f)
+    if len(parts) >= 3:
+        ops = parts[1::2]
+        vals = parts[0::2]
+        cmp = {"<": lambda a, b: a < b, "<=": lambda a, b: a <= b,
+               ">": lambda a, b: a > b, ">=": lambda a, b: a >= b,
+               "=": lambda a, b: a == b}
+        nums = []
+        for v in vals:
+            nums.append(dims[v.strip().lower()] if v.strip().lower() in dims
+                        else _length_px(v))
+        if None in nums:
+            return False
+        return all(cmp[o](nums[i], nums[i + 1]) for i, o in enumerate(ops))
+    return f.lower() in ("color", "hover", "any-hover", "pointer",
+                         "any-pointer")  # boolean-context features
+
+
+def _media_query_true(query):
+    """Does a media query list (comma = or) match the assumed viewport?"""
+    for q in query.split(","):
+        q = q.strip().lower()
+        if not q:
+            return True
+        neg = False
+        if q.startswith("not "):
+            neg, q = True, q[4:].strip()
+        q = re.sub(r"^only\s+", "", q)
+        mt = re.match(r"([a-z-]+)", q)
+        mtype = mt.group(1) if mt and mt.group(1) not in ("and", "not") \
+            else "all"
+        ok = mtype in ("all", "screen")
+        i = 0
+        while ok and i < len(q):
+            if q[i] == "(":
+                j = _balanced_paren(q, i)
+                ok = _feature_true(q[i + 1:j])
+                i = j + 1
+            else:
+                i += 1
+        if ok != neg:
+            return True
+    return False
+
+
+def _resolve_media(css):
+    """Evaluate @media blocks against the assumed desktop viewport: matching
+    blocks are unwrapped in place, the others removed.  (IE6 knows no @media,
+    and stripping them all loses the desktop layout that modern sites define
+    in min-width queries.)  `@supports not (...)` fallbacks are unwrapped as
+    well -- IE6 supports nothing -- and the other @supports blocks dropped."""
+    pat = re.compile(r"@(media|supports)\b([^{;]*)\{", re.I)
+    pos = 0
     while True:
-        m = pat.search(css)
+        m = pat.search(css, pos)
         if not m:
             return css
         j = _balanced_brace(css, m.end() - 1)
-        if j is None:
-            return css
-        css = css[: m.start()] + css[m.end() : j] + css[j + 1 :]
+        if m.group(1).lower() == "media":
+            keep = _media_query_true(m.group(2))
+        else:
+            keep = m.group(2).strip().lower().startswith("not ")
+        if keep:
+            css = css[:m.start()] + css[m.end():j] + css[j + 1:]
+            pos = m.start()  # re-scan the unwrapped contents
+        else:
+            css = css[:m.start()] + css[j + 1:]
+            pos = m.start()
 
 
 def _strip_at_blocks(css, names):
@@ -475,6 +578,12 @@ def _transform_decls(body):
             if f:
                 filters.append(f)
             continue
+        if p in ("background", "background-image") and "/" in v:
+            # `center / 16px url(..)`: the CSS3 position/size form invalidates
+            # the whole shorthand in IE6.  Drop the size part (keep the image).
+            v = re.sub(
+                r"/\s*(?:cover|contain|auto|[\d.]+(?:px|em|%)?)"
+                r"(?:\s+(?:auto|[\d.]+(?:px|em|%)?))?", "", v)
         g = _gradient_filter(v)
         if g:
             hb = _hairline_decls(v, body)
@@ -497,6 +606,18 @@ def _transform_decls(body):
                     hexc = _to_hex(g[1])
                     if hexc:
                         decls.append("background-color: %s" % hexc)
+            continue
+        if p in ("mask-image", "-webkit-mask-image"):
+            # Icon masks (`background-color: <icon colour>` + mask-image: the
+            # glyph shape).  IE6 has no masks; show the glyph itself as the
+            # background and suppress the (now-solid) colour fill.
+            um = re.match(r"url\([^)]*\)", v)
+            if um and "data:" not in um.group(0):
+                decls.append("background-image: %s !important" % um.group(0))
+                decls.append("background-color: transparent !important")
+                decls.append("background-repeat: no-repeat")
+            continue
+        if p.startswith("-webkit-mask"):
             continue
         if p in ("filter", "-ms-filter"):
             if "progid:" in v.lower():  # already an IE filter -- keep it
@@ -554,6 +675,15 @@ def _transform_decls(body):
     # JS scroll handler.  CSS expression() -- the classic IE6 "position:
     # fixed" hack -- is ignored in the standards mode the proxy forces via
     # the XHTML Strict doctype, so it can't do the pinning.
+    decls = [d for d in map(_degrade_inherit, decls) if d]
+    # Image-replacement: `text-indent:-9999px` hides the label of a button
+    # or link, but IE6 ignores text-indent on <input>, leaving the text
+    # painted over the background.  A zero font-size hides it there too.
+    ti = re.search(r"(?<![\w-])text-indent\s*:\s*-\s*(\d+)", body, re.I)
+    if ti and int(ti.group(1)) >= 900:
+        decls = [d for d in decls
+                 if not re.match(r"\s*font-size\s*:", d, re.I)]
+        decls.append("font-size: 0")
     # IE6 quirk: a later plain declaration overrides an earlier !important
     # one in the same rule, so de-duplicate per property, keeping the last
     # value but preferring the !important variant.
@@ -580,19 +710,78 @@ def _transform_decls(body):
     return "; ".join(decls)
 
 
+# IE6 doesn't understand `inherit` (outside of direction/visibility) and
+# drops the declaration, so a heading reset like `.mw-heading h2 {font-size:
+# inherit}` never happens and nested sizes compound (h2 inside a 150% wrapper
+# renders at 150% x 150%).  Where an equivalent exists we use it; otherwise
+# the declaration is dropped, as IE6 would anyway.
+_INHERIT_EQUIV = {
+    "font-size": "100%",       # exactly equivalent
+    "font-weight": "normal",   # resets UA bold on headings (the usual intent)
+    "font-style": "normal",
+    "font-variant": "normal",
+    "line-height": "normal",
+}
+
+
+def _degrade_inherit(decl):
+    prop, _, val = decl.partition(":")
+    if val.strip().lower() != "inherit":
+        return decl
+    eq = _INHERIT_EQUIV.get(prop.strip().lower())
+    return "%s: %s" % (prop.strip(), eq) if eq else None
+
+
 def _eval_calc(inner):
+    """Approximate the body of a calc() for IE6, which has no calc().
+
+    Same-unit arithmetic is folded to a single value.  Mixed units can't be
+    expressed; `N% +/- <length>` degrades to `N%`, anything else to `auto`
+    (an invalid value for most properties, so IE6 drops the declaration
+    cleanly instead of choking on a stray `calc(`)."""
     s = inner.strip()
-    if re.fullmatch(r"[\d\s.+\-*/()]+", s):
-        try:
-            return "%gpx" % eval(s, {"__builtins__": {}}, {})
-        except Exception:
-            pass
-    if "%" in s and re.fullmatch(r"[\d\s.%+\-*/()]+", s):
-        try:
-            return "%g%%" % eval(s, {"__builtins__": {}}, {})
-        except Exception:
-            pass
-    return inner  # leave it; IE6 will simply ignore the declaration
+    units = set(re.findall(r"[a-zA-Z%]+", s))
+    if len(units) <= 1:
+        bare = re.sub(r"[a-zA-Z%]+", "", s)
+        # no `**` / `//`: keeps the evaluation cheap (no huge powers)
+        if (re.fullmatch(r"[\d\s.+\-*/()]+", bare)
+                and "**" not in bare and "//" not in bare):
+            try:
+                return "%g%s" % (eval(bare, {"__builtins__": {}}, {}),
+                                 next(iter(units), ""))
+            except Exception:
+                pass
+    m = re.fullmatch(r"\(?\s*(\d*\.?\d+)%\s*[-+]\s*\d*\.?\d+[a-z]+\s*\)?", s, re.I)
+    if m:
+        return m.group(1) + "%"
+    return "auto"
+
+
+def _replace_light_dark(css):
+    """light-dark(a, b) -> a (the page is rendered with the light scheme)."""
+    while True:
+        m = re.search(r"light-dark\(", css)
+        if not m:
+            return css
+        j = _balanced_paren(css, m.end() - 1)
+        inner, depth, cut = css[m.end():j], 0, len(css[m.end():j])
+        for k, ch in enumerate(inner):
+            depth += ch == "("
+            depth -= ch == ")"
+            if ch == "," and depth == 0:
+                cut = k
+                break
+        css = css[:m.start()] + inner[:cut].strip() + css[j + 1:]
+
+
+def _replace_calc(css):
+    """Replace every calc(...) (nested parens included) via _eval_calc."""
+    while True:
+        m = re.search(r"calc\(", css)
+        if not m:
+            return css
+        j = _balanced_paren(css, m.end() - 1)
+        css = css[:m.start()] + _eval_calc(css[m.end():j]) + css[j + 1:]
 
 
 def _rewrite_css_urls(css, base, abs_base=None):
@@ -606,7 +795,7 @@ def _rewrite_css_urls(css, base, abs_base=None):
     return re.sub(r"url\(\s*(['\"]?)(.*?)\1\s*\)", sub, css)
 
 
-def _degrade_selector(sel):
+def _degrade_selector(sel, synth=None):
     """Approximate selector syntax IE6 cannot parse.
 
     IE6 only understands element, #id, .class, * and the descendant
@@ -615,32 +804,48 @@ def _degrade_selector(sel):
     degrade cleanly to the closest supported form:
 
       a > b          -> a b          (child -> descendant)
-      el[attr]       -> el           (drop the attribute selector)
+      a + b, a ~ b,
+      :first-child   -> .ie6x<hash>  (synthetic class, see selectors.py)
+      el[attr]       -> .ie6x<hash>  (synthetic class the proxy adds to
+                                       the matching elements, see selectors)
       el:first-child -> el           (apply to every match)
       :root          -> html
-      el:-moz-x      -> el           (drop vendor pseudo-classes)
 
-    Multiple classes (.a.b) are left alone: IE6 already reads them as the
-    last class only.  :hover/:focus/:before/:after and the + / ~ sibling
+    Chained classes (.a.b, which IE6 reads as just .b) get the same synthetic
+    class treatment as attribute selectors.  :hover/:focus/:before/:after and the + / ~ sibling
     combinators are left in place -- degrading them would mis-style, so IE6
     simply drops those rules."""
     sel = re.sub(r":root\b", "html", sel)
+    sel = rewrite_selector(sel, synth)
+    # remaining child combinators degrade to descendant
     sel = re.sub(r"\s*>\s*", " ", sel)
-    sel = re.sub(r"\[[^\]]*\]", "", sel)
-    sel = re.sub(r":first-child", "", sel)
-    sel = re.sub(r":-(?:moz|webkit|ms|o)-[a-z-]+", "", sel)
     # drops above can empty out a comma-list part (e.g. [type='button'])
     return ",".join(p for p in (s.strip() for s in sel.split(",")) if p)
 
 
-def _filter_rules(css):
+# Vendor / state pseudos that IE6 can't evaluate.  Stripping them would apply
+# the rule to the plain element (e.g. `input::-webkit-search-cancel-button
+# {display:none}` would hide the whole input), so the selector is dropped.
+_UNSUPPORTED_PSEUDO_RE = re.compile(
+    r"::?-(?:webkit|moz|ms|o)-|::(?:placeholder|selection|marker|backdrop|"
+    r"file-selector-button)|:(?:placeholder-shown|focus-visible|checked|"
+    r"disabled|enabled|required|optional|target|empty|"
+    r"first-of-type|last-of-type|only-of-type|lang\()", re.I)
+
+
+def _filter_rules(css, synth=None):
     def sub(m):
         sel, body = m.group(1), m.group(2)
+        # comma-list parts IE6 can't evaluate are dropped individually
+        sel = ",".join(p for p in sel.split(",")
+                       if not _UNSUPPORTED_PSEUDO_RE.search(p))
+        if not sel.strip():
+            return ""
         sel = sel.replace("::", ":")  # IE6 uses single-colon pseudos
         sel = _strip_simple_nots(sel)
         if BAD_SELECTOR_RE.search(sel):
             return ""
-        sel = _degrade_selector(sel)
+        sel = _degrade_selector(sel, synth)
         decls = _transform_decls(body)
         if not decls:
             return ""
@@ -855,16 +1060,17 @@ def _resolve_vars(css):
     return re.sub(r"([^{}]+)\{([^{}]*)\}", walk, css)
 
 
-def transform_css(css, base, abs_base=None):
+def transform_css(css, base, abs_base=None, synth=None):
     css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+    css = _resolve_media(css)
     css = _flatten_css(css)
     css = _resolve_vars(css)
-    css = _unwrap_plain_media(css)
     # Fully-transparent rgba() -> nothing: a 4-value rgb() in a shorthand
     # (e.g. `background: rgba(0,0,0,0) url(...)`) invalidates the whole
     # declaration in IE6 and would drop the image layer with it.
     css = re.sub(
-        r"(?:rgba|rgb)\(\s*0\s*,\s*0\s*,\s*0\s*,\s*0\s*\)\s*", "", css, re.I)
+        r"(?:rgba|rgb)\(\s*0\s*,\s*0\s*,\s*0\s*,\s*0\s*\)\s*", "", css,
+        flags=re.I)
     css = _strip_at_blocks(
         css, ["font-face", "keyframes", "-webkit-keyframes", "-moz-keyframes"]
     )
@@ -874,11 +1080,12 @@ def transform_css(css, base, abs_base=None):
     # recover the alpha for the DX filters.
     css = re.sub(
         r"rgba\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*([\d.]+%?)\s*\)",
-        r"rgb(\1,\2,\3,\4)", css, re.I,
+        r"rgb(\1,\2,\3,\4)", css, flags=re.I,
     )
     css = re.sub(r"\s{2,}", " ", css)
     css = re.sub(
-        r"rgba\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)", r"rgb(\1,\2,\3)", css, re.I
+        r"rgba\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)", r"rgb(\1,\2,\3)", css,
+        flags=re.I,
     )
 
     def _hsl(m):
@@ -893,16 +1100,17 @@ def transform_css(css, base, abs_base=None):
     css = re.sub(
         r"hsla?\(\s*([\d.]+)\s*,\s*([\d.]+)%\s*,\s*([\d.]+)%", _hsl, css
     )
-    css = re.sub(r"calc\(([^)]*)\)", lambda m: _eval_calc(m.group(1)), css)
-    # IE6-era screens: assume ~1024x768 for vw/vh approximations
+    css = _replace_light_dark(css)
+    css = _replace_calc(css)
+    # vw/vh against the assumed viewport (config.py)
     css = re.sub(
         r"(\d*\.?\d+)\s*vw",  # require >=1 digit so a lone '.' can't reach float()
-        lambda m: "%dpx" % round(float(m.group(1)) * 10.24),
+        lambda m: "%dpx" % round(float(m.group(1)) * VIEWPORT_WIDTH / 100),
         css,
     )
     css = re.sub(
         r"(\d*\.?\d+)\s*vh",  # require >=1 digit so a lone '.' can't reach float()
-        lambda m: "%dpx" % round(float(m.group(1)) * 7.68),
+        lambda m: "%dpx" % round(float(m.group(1)) * VIEWPORT_HEIGHT / 100),
         css,
     )
     # rem: IE6 knows no root-relative units; 1rem = 16px (the root default).
@@ -914,7 +1122,7 @@ def transform_css(css, base, abs_base=None):
         css,
     )
     css = _rewrite_css_urls(css, base, abs_base)
-    css = _filter_rules(css)
+    css = _filter_rules(css, synth)
     return css
 
 

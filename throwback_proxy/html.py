@@ -34,6 +34,9 @@ TAG_MAP = {
     "rp": "span",
     "rtc": "span",
     "datalist": "span",
+    "hgroup": "div",
+    "search": "div",
+    "data": "span",
 }
 
 ATTR_RE = re.compile(
@@ -46,7 +49,22 @@ ATTR_RE = re.compile(
 IE6_SHIM = (
     "<script>"
     "if(!window.console){window.console={log:function(){},warn:function(){},"
-    "error:function(){}};}"
+    "error:function(){},info:function(){},debug:function(){}};}"
+    "if(!Array.prototype.indexOf){Array.prototype.indexOf=function(x,i){for(i="
+    "i||0;i<this.length;i++){if(this[i]===x){return i;}}return -1;};}"
+    "if(!Array.prototype.map){Array.prototype.map=function(f){var r=[];for(var "
+    "i=0;i<this.length;i++){r[i]=f(this[i],i,this);}return r;};}"
+    "if(!Array.prototype.filter){Array.prototype.filter=function(f){var r=[];"
+    "for(var i=0;i<this.length;i++){if(f(this[i],i,this)){r.push(this[i]);}}"
+    "return r;};}"
+    "if(!String.prototype.trim){String.prototype.trim=function(){return this."
+    "replace(/^\\s+|\\s+$/g,'');};}"
+    "if(!Date.now){Date.now=function(){return +new Date();};}"
+    "if(!Object.keys){Object.keys=function(o){var r=[];for(var k in o){if("
+    "Object.prototype.hasOwnProperty.call(o,k)){r.push(k);}}return r;};}"
+    "if(!Function.prototype.bind){Function.prototype.bind=function(t){var f="
+    "this,a=Array.prototype.slice.call(arguments,1);return function(){return "
+    "f.apply(t,a.concat(Array.prototype.slice.call(arguments)));};};}"
     "if(!Array.prototype.forEach){Array.prototype.forEach=function(f){for("
     "var i=0;i<this.length;i++){f(this[i],i,this);}};}"
     "if(!document.querySelector){document.querySelector=function(){return null;};}"
@@ -90,9 +108,15 @@ def _rewrite_attrs(tag, base, abs_base=None):
         # src/href/poster are the usual URL attributes; resource and
         # content are MediaWiki's lazy-load URL attributes (IE6 never runs
         # the lazy-load JS, but the URLs should still be http).
-        if name in ("src", "href", "poster", "resource", "content") and val:
+        if name in ("src", "href", "poster", "action", "background",
+                    "resource", "content") and val:
             v = val.strip()
             if v.lower().startswith(SKIP_URL_PREFIXES):
+                return a.group(0)
+            # resource/content hold arbitrary text on <meta> (descriptions,
+            # viewport...): only rewrite them when they are really URLs.
+            if name in ("resource", "content") \
+                    and not re.match(r"(?:https?:)?//", v, re.I):
                 return a.group(0)
             absu = urljoin(base, v)
             if urlparse(absu).scheme in ("http", "https"):
@@ -121,6 +145,12 @@ def transform_html(html, base, abs_base=None):
     def _inline_script(m):
         open_tag, body = m.group(1), m.group(2)
         if re.search(r"\bsrc\s*=", open_tag, re.I):
+            return m.group(0)
+        # Only touch real JavaScript: JSON-LD, text/template etc. contain
+        # prose like "let us know" that the const/let rewrite would mangle.
+        tm = re.search(r"\btype\s*=\s*['\"]?([^'\"\s>]+)", open_tag, re.I)
+        if tm and "javascript" not in tm.group(1).lower() \
+                and "ecmascript" not in tm.group(1).lower():
             return m.group(0)
         return open_tag + _downgrade_js(body) + "</script>"
 
@@ -154,6 +184,10 @@ def transform_html(html, base, abs_base=None):
     html = re.sub(r"<template\b[^>]*>.*?</template\s*>", "", html,
                   flags=re.I | re.S)
 
+    # Inline <svg>: IE6 ignores the unknown element but renders its text
+    # children (<title>, <text>) as stray page text -- drop it.
+    html = re.sub(r"<svg\b[^>]*>.*?</svg\s*>", "", html, flags=re.I | re.S)
+
     # Media elements IE6 cannot show: sized placeholders where possible.
     def _media_ph(m):
         tag, attrs = m.group(1), (m.group(2) or "")
@@ -184,27 +218,39 @@ def transform_html(html, base, abs_base=None):
         html = re.sub(r"</%s\s*>" % old, "</%s>" % new, html, flags=re.I)
     html = re.sub(r"<wbr\s*/?>", "", html, flags=re.I)
 
-    # Standards-mode doctype + explicit charset for IE6.
+    # Standards-mode doctype + explicit charset for IE6.  IE6 only enters
+    # standards mode when the DOCTYPE is the very first thing in the file: an
+    # XML prolog, BOM, comment or whitespace before it forces quirks mode.
+    html = html.lstrip("\ufeff \t\r\n")
+    html = re.sub(r"^<\?xml[^>]*\?>\s*", "", html, flags=re.I)
+    if re.search(r"<!doctype[^>]*>", html, re.I):
+        html = re.sub(r"^.*?(?=<!doctype)", "", html, count=1,
+                      flags=re.I | re.S)
+        html = re.sub(r"<!doctype[^>]*>", XHTML_STRICT_DOCTYPE, html,
+                      count=1, flags=re.I)
+    else:
+        html = XHTML_STRICT_DOCTYPE + "\n" + html
+    # The proxy always re-encodes the page as UTF-8, so any charset the page
+    # declares must be rewritten to match (also expanding the HTML5
+    # <meta charset> shorthand, which IE6 does not understand).
     html = re.sub(
-        r"<!doctype[^>]*>", XHTML_STRICT_DOCTYPE, html, count=1, flags=re.I
-    )
-    # IE6 does not understand the HTML5 <meta charset> shorthand --
-    # rewrite it to the http-equiv form it does.
-    html = re.sub(
-        r"<meta\s+charset\s*=\s*(['\"])([^'\"]+)\1\s*/?>",
-        r'<meta http-equiv="Content-Type" content="text/html; charset=\2">',
+        r"<meta\s+charset\s*=\s*(['\"]?)[^'\"\s>/]+\1\s*/?>",
+        '<meta http-equiv="Content-Type" content="text/html; charset=utf-8">',
         html, flags=re.I)
+    html = re.sub(
+        r"(<meta\b[^>]*content\s*=\s*['\"][^'\"]*?charset\s*=\s*)[\w-]+",
+        r"\1utf-8", html, flags=re.I)
     if not re.search(r"<meta[^>]+charset", html, re.I):
         ins = '<meta http-equiv="Content-Type" content="text/html; charset=utf-8">'
-        if re.search(r"<head[^>]*>", html, re.I):
-            html = re.sub(r"(<head[^>]*>)", r"\1" + ins, html, count=1, flags=re.I)
-        elif re.search(r"<html[^>]*>", html, re.I):
-            html = re.sub(r"(<html[^>]*>)", r"\1" + ins, html, count=1, flags=re.I)
+        if re.search(r"<head\b[^>]*>", html, re.I):
+            html = re.sub(r"(<head\b[^>]*>)", r"\1" + ins, html, count=1, flags=re.I)
+        elif re.search(r"<html\b[^>]*>", html, re.I):
+            html = re.sub(r"(<html\b[^>]*>)", r"\1" + ins, html, count=1, flags=re.I)
 
     # ES5 compatibility shims, before any page script can run.
-    if re.search(r"<head[^>]*>", html, re.I):
+    if re.search(r"<head\b[^>]*>", html, re.I):
         html = re.sub(
-            r"(<head[^>]*>)", lambda m: m.group(1) + IE6_SHIM,
+            r"(<head\b[^>]*>)", lambda m: m.group(1) + IE6_SHIM,
             html,
             count=1,
             flags=re.I,

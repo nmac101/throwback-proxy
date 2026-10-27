@@ -9,6 +9,12 @@ UPSTREAM_UA = (
 # ---------------------------------------------------------------------------
 # Ad / tracking domains (matched as host suffixes)
 # ---------------------------------------------------------------------------
+# Assumed IE6 viewport.  @media queries are evaluated against it (instead of
+# being stripped) so sites get their desktop layout, and vw/vh units are
+# converted with it.
+VIEWPORT_WIDTH = 1280
+VIEWPORT_HEIGHT = 768
+
 AD_DOMAINS = {
     "doubleclick.net",
     "googlesyndication.com",

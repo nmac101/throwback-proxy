@@ -9,24 +9,132 @@ from urllib.parse import urljoin
 from .css import _strip_at_blocks
 from .urls import to_proxy
 
+class FlexClasses(set):
+    """Row-flex container classes found in a page's CSS.
+
+    The set itself holds classes that are flex containers wherever they
+    appear.  `scoped` maps a class to the ancestor requirements of rules like
+    ".user-menu .list {display:flex}": there, only a .list *inside* a
+    .user-menu is a flex row -- other .list elements (e.g. a sidebar menu
+    sharing the same component class) are plain blocks."""
+
+    def __init__(self):
+        super().__init__()
+        self.scoped = {}  # class -> [frozenset(ancestor tokens), ...]
+        self.justify = {}  # class -> justify-content value
+        self.grow = set()  # classes with flex-grow >= 1 (fill the row)
+
+    def __bool__(self):
+        return bool(len(self) or self.scoped)
+
+    def merge(self, other):
+        self.update(other)
+        for k, v in other.scoped.items():
+            self.scoped.setdefault(k, []).extend(v)
+        self.justify.update(other.justify)
+        self.grow |= other.grow
+
+    def justify_of(self, classes):
+        for c in classes:
+            if c in self.justify:
+                return self.justify[c]
+        return None
+
+    def matches(self, classes, ancestors):
+        """Is an element with *classes* inside *ancestors* a flex row?
+        (*ancestors*: class names and "#id" tokens of its ancestors.)"""
+        if classes & self:
+            return True
+        for c in classes:
+            for req in self.scoped.get(c, ()):
+                if req <= ancestors:
+                    return True
+        return False
+
+
 def _flex_container_classes(css):
-    """Class names of row-direction flex containers (the ones that lay their
-    children out side by side). Column flex degrades fine to plain block."""
-    classes = set()
+    """Row-direction flex containers (the ones that lay their children out
+    side by side), as a FlexClasses. Column flex degrades fine to plain
+    block."""
+    classes = FlexClasses()
+    for rm in re.finditer(r"([^{}]+)\{([^{}]*)\}", css):
+        if re.search(r"(?<![\w-])flex(?:-grow)?\s*:\s*[1-9]", rm.group(2),
+                     re.I):
+            for part in rm.group(1).split(","):
+                gm = list(re.finditer(r"([.#])([A-Za-z_][\w-]*)", part))
+                if gm:  # ids are kept with their "#" (classes can't clash)
+                    classes.grow.add(("#" if gm[-1].group(1) == "#" else "")
+                                     + gm[-1].group(2))
+    # Later rules override earlier ones (".mw-header{display:flex}" ...
+    # ".mw-header{display:grid}" is a grid), so keep the last display set
+    # for each selector part.
+    state = {}  # selector part -> (is-row-flex, rule body)
     for rm in re.finditer(r"([^{}]+)\{([^{}]*)\}", css):
         sel, body = rm.group(1), rm.group(2)
-        if not re.search(r"display\s*:\s*(?:inline-)?flex\b", body, re.I):
+        dm = re.search(r"(?<![\w-])display\s*:\s*([\w-]+)", body, re.I)
+        if not dm:
             continue
-        if re.search(r"flex-direction\s*:\s*column", body, re.I):
-            continue
-        # Only the last class in each selector part is the flex container;
-        # earlier classes are ancestor components (e.g. ".mw-header
-        # .vector-header-end" is the end row, not .mw-header).
+        is_flex = (dm.group(1).lower() in ("flex", "inline-flex")
+                   and not re.search(r"flex-direction\s*:\s*column", body,
+                                     re.I))
         for part in sel.split(","):
+            state[part.strip()] = (is_flex, body)
+    for part, (is_flex, body) in state.items():
+        if is_flex:
+            # Only the last class in each selector part is the flex
+            # container; earlier classes are ancestor components (e.g.
+            # ".mw-header .vector-header-end" is the end row, not .mw-header).
             cm = list(re.finditer(r"\.([A-Za-z_][\w-]*)", part))
-            if cm:
-                classes.add(cm[-1].group(1))
+            if not cm:
+                continue
+            last = cm[-1]
+            jm = re.search(r"justify-content\s*:\s*([\w-]+)", body, re.I)
+            if jm:
+                classes.justify[last.group(1)] = jm.group(1).lower()
+            # classes/ids named before the last compound are ancestors
+            cut = max(part.rfind(c, 0, last.start()) for c in " >+~")
+            head = re.sub(r":not\([^)]*\)", "", part[:cut + 1])
+            req = frozenset(
+                t[1:] if t[0] == "." else t
+                for t in re.findall(r"\.[A-Za-z_][\w-]*|#[A-Za-z_][\w-]*", head)
+            )
+            if req:
+                classes.scoped.setdefault(last.group(1), []).append(req)
+            else:
+                classes.add(last.group(1))
     return classes
+
+
+def _ancestor_map(html):
+    """{open-tag start offset: frozenset(class names and "#id" tokens of the
+    element's ancestors)}.  A light stack walk: end tags pop back to the
+    nearest open element of the same name, so optional end tags (<li>, <p>)
+    don't derail it."""
+    out = {}
+    stack = []  # (tag, cumulative tokens including this element's own)
+    cur = frozenset()
+    for m in re.finditer(r"</?([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)>", html):
+        tag, attrs = m.group(1).lower(), m.group(2) or ""
+        if m.group(0)[1] == "/":
+            for i in range(len(stack) - 1, -1, -1):
+                if stack[i][0] == tag:
+                    del stack[i:]
+                    cur = stack[-1][1] if stack else frozenset()
+                    break
+            continue
+        out[m.start()] = cur
+        if tag in _VOID_TAGS or attrs.rstrip().endswith("/"):
+            continue
+        toks = set()
+        cm = re.search(r'class\s*=\s*["\']([^"\']*)["\']', attrs, re.I)
+        if cm:
+            toks.update(cm.group(1).split())
+        im = re.search(r'\bid\s*=\s*["\']([^"\']*)["\']', attrs, re.I)
+        if im:
+            toks.add("#" + im.group(1))
+        cur = cur | toks if toks else cur
+        stack.append((tag, cur))
+    return out
 
 
 _FLEX_ROW_CHILD_TAGS = set(
@@ -209,6 +317,7 @@ def _flex_sibling_floats(html, flex_classes, full_width=None):
     if not flex_classes:
         return []
     full_width = full_width or set()
+    anc = _ancestor_map(html) if flex_classes.scoped else {}
     els = []  # {start, end, flex, cls, parent}
     open_stack = []  # (tag, index_in_els)
     for m in re.finditer(r"</?([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)>", html):
@@ -224,7 +333,9 @@ def _flex_sibling_floats(html, flex_classes, full_width=None):
         cls = set(cm.group(1).split()) if cm else set()
         idx = len(els)
         els.append({"start": m.start(), "end": m.end(),
-                    "flex": bool(cls & flex_classes), "cls": cls,
+                    "flex": flex_classes.matches(
+                        cls, anc.get(m.start(), frozenset())),
+                    "cls": cls,
                     "parent": parent})
         open_stack.append((tag, idx))
     by_parent = {}
@@ -349,14 +460,16 @@ def _flex_row_layout(html, flex_classes, widths, pinned=None,
     full_width = full_width or set()
     row_widths = row_widths or {}
     edits = []  # (open_start, open_end, css-to-append)
+    anc = _ancestor_map(html) if flex_classes.scoped else {}
     for m in re.finditer(r"<([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)>", html):
         attrs = m.group(2) or ""
         cm = re.search(r'class\s*=\s*["\']([^"\']*)["\']', attrs, re.I)
         if not cm:
             continue
-        if not (set(cm.group(1).split()) & flex_classes):
+        if not flex_classes.matches(set(cm.group(1).split()),
+                                    anc.get(m.start(), frozenset())):
             continue
-        children = []  # (start, end, classes-set, has-inline-display)
+        children = []  # (start, end, tag, classes-set, has-inline-display)
         depth = 1
         start = m.end()
         for tm in re.finditer(r"</?([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)?>", html[start:]):
@@ -371,10 +484,13 @@ def _flex_row_layout(html, flex_classes, widths, pinned=None,
             if depth == 1 and tag in _FLEX_ROW_CHILD_TAGS:
                 ccm = re.search(r'class\s*=\s*["\']([^"\']*)["\']', tattrs, re.I)
                 sm = re.search(r'style\s*=\s*["\']([^"\']*)["\']', tattrs, re.I)
+                cid = re.search(r'\bid\s*=\s*["\']([^"\']*)["\']', tattrs, re.I)
                 children.append((
                     start + tm.start(),
                     start + tm.end(),
-                    set(ccm.group(1).split()) if ccm else set(),
+                    tag,
+                    (set(ccm.group(1).split()) if ccm else set())
+                    | ({"#" + cid.group(1)} if cid else set()),
                     bool(sm and re.search(r"display", sm.group(1), re.I)),
                 ))
             depth += 1
@@ -382,10 +498,10 @@ def _flex_row_layout(html, flex_classes, widths, pinned=None,
             continue
         has_floated = any(
             (not cd) and any(k in widths for k in cclasses)
-            for _, _, cclasses, cd in children
+            for _, _, _, cclasses, cd in children
         )
         pinned_w = next(
-            (widths[k] for _, _, ccs, cd in children
+            (widths[k] for _, _, _, ccs, cd in children
              if not cd for k in ccs if k in pinned and k in widths),
             None,
         )
@@ -399,13 +515,61 @@ def _flex_row_layout(html, flex_classes, widths, pinned=None,
                 if k in row_widths:
                     ew = row_widths[k] // len(children)
                     break
-        for cs, ce, cclasses, cd in children:
+        # justify-content pushes the last item to the far end of the row
+        # (space-between header: logo left, tools right; flex-end title bar).
+        # IE6 can't, so the last child is absolutely positioned at the right
+        # edge of a relatively positioned container.
+        jc = flex_classes.justify_of(cm.group(1).split())
+        tail = None
+        if all_float and not ew and (
+                (jc == "space-between" and len(children) >= 2)
+                or (jc in ("flex-end", "end", "right"))):
+            tail = children[-1][0]
+            if jc in ("flex-end", "end", "right") and len(children) >= 2:
+                # a right-aligned group: float each child right (visual order
+                # within the group is reversed, the cost of floating)
+                tail = None
+                for cs, ce, ctag, cclasses, cd in children:
+                    if not cd:
+                        edits.append((cs, ce, "float:right;" + (
+                            "display:block;" if ctag == "li" else "")))
+                children = []
+        grow_fill = grow_tail = None
+        if all_float and not ew and not tail and len(children) >= 2:
+            gi = next((i for i, c in enumerate(children)
+                       if c[3] & flex_classes.grow), None)
+            if gi == len(children) - 1:
+                grow_fill = children[gi][0]
+            elif gi == 0 and len(children) == 2 and not children[1][4]:
+                grow_tail = children[1][0]
+        for cs, ce, ctag, cclasses, cd in children:
             if cd:  # keep explicit inline display untouched
                 continue
+            if grow_fill == cs:
+                # flex-grow child: fills the space left beside the floated
+                # siblings (a block formatting context shrinks to fit them)
+                edits.append((cs, ce, "overflow:hidden;" + (
+                    "zoom:1;" if ctag != "li" else "")))
+                continue
+            if grow_tail == cs:
+                # [flex-grow child, one trailing child]: pin the trailing
+                # child to the right edge instead of floating it
+                edits.append((cs, ce, "position:absolute;right:0;top:0;"))
+                edits.append((m.start(), m.end(), "position:relative;zoom:1;"))
+                continue
+            if cs == tail:
+                edits.append((cs, ce, "position:absolute;right:0;top:0;"))
+                edits.append((m.start(), m.end(), "position:relative;zoom:1;"))
+                continue
+            # IE6 bug: a floated <li> (display:list-item) collapses to a
+            # few characters wide, wrapping its text one word/character at a
+            # time (e.g. MediaWiki Vector sidebar menus).  display:block
+            # restores the normal shrink-to-fit float width.
+            li_fix = "display:block;" if ctag == "li" else ""
             if pinned_w is not None and any(k in pinned for k in cclasses):
                 add = "position:absolute;left:0;"
             elif has_floated and any(k in widths for k in cclasses):
-                add = "float:left;height:auto;"
+                add = "float:left;height:auto;" + li_fix
             elif pinned_w is not None:
                 add = "margin-left:%dpx;" % pinned_w
             elif has_floated:
@@ -416,7 +580,7 @@ def _flex_row_layout(html, flex_classes, widths, pinned=None,
                 # No child has a known width: float them left so the row's
                 # block-level items flow horizontally (display:inline would
                 # leave them stacked, since their content is block-level).
-                add = "float:left;"
+                add = "float:left;" + li_fix
             edits.append((cs, ce, add))
         if all_float:
             # clearfix on the container so it wraps the floated children

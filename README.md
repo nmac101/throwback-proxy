@@ -103,3 +103,9 @@ Requests whose host matches a known ad/tracking domain (doubleclick, googlesyndi
 - Gradient/shadow approximations are lossy: only the two end colors and the nearest of four directions survive; multiple shadows collapse to the first. `border-radius`, `transform`, transitions and animations have no IE6 equivalent and are dropped.
 - JavaScript that *runs* is left as-is; modern ES2015+ scripts will simply fail silently in IE6, which is why module scripts are dropped up front.
 - POST requests and uploads are not proxied (IE6-era browsing was mostly GET).
+
+## Tests
+
+```sh
+python3 -m unittest discover -s tests
+```
