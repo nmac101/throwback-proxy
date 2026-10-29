@@ -1,5 +1,5 @@
 # Throwback Proxy
-## Backporting the modern internet to old browsers
+### Backporting the modern internet to old browsers
 
 > [!WARNING]
 > i wanna be as transparent as possible about this, so i'm gonna start off by saying that a qwen 27b model was heavily used for this project. this is my first ever attempt at "vibecoding" (while reviewing the code to some extent) since i dont have the time nor patience to research 25 year old webdev.
