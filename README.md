@@ -1,11 +1,11 @@
 # Throwback Proxy
 ### Backporting the modern internet to old browsers
-
+---
 > [!WARNING]
 > i wanna be as transparent as possible about this, so i'm gonna start off by saying that a qwen 27b model was heavily used for this project. this is my first ever attempt at "vibecoding" (while reviewing the code to some extent) since i dont have the time nor patience to research 25 year old webdev.
 > 
 > **no water was wasted on the making of this project, since i ran the model locally.** if that's not enough for you, code yourself an alternative, and i don't mean that in a bad way. i'd love to see more projects like this on foss spaces.
-
+---
 An HTTP proxy in pure Python (stdlib only) that rewrites modern web pages so
 they can be rendered by **Internet Explorer 6**, mostly preserving the original
 page structure — and blocks ads on the way.
