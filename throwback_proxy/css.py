@@ -1,6 +1,5 @@
 """CSS rewriting: down-grade modern CSS to what IE6 understands
-(flexbox -> inline-block, position:fixed -> absolute, gradients/shadows/
-opacity -> DXImageTransform filters, rgba()/hsl() -> rgb(),
+(flexbox -> inline-block, position:fixed -> absolute, gradients/opacity -> DXImageTransform filters, rgba()/hsl() -> rgb(),
 calc()/vw/vh/rem approximated, unsupported properties and selectors
 dropped, url() references rewritten through the proxy)."""
 
@@ -9,33 +8,15 @@ import re
 from urllib.parse import urljoin
 
 from .config import VIEWPORT_HEIGHT, VIEWPORT_WIDTH
-from .selectors import rewrite_selector
+from .selectors import rewrite_selector, split_selectors
+from .metrics import record_box_rules
+from .media import (_balanced_brace, _balanced_paren, _feature_true,
+    _length_px, _media_query_true, _resolve_media, _strip_at_blocks)
+from .colors import (_COLOR_RE, _NAMED_COLORS, _gradient_angle,
+    _gradient_filter, _gradient_stop_positions, _hairline_decls,
+    _parse_color, _px, _to_argb, _to_hex)
 from .urls import to_proxy
 
-def _balanced_paren(s, i):
-    """s[i] == '(' -> index of matching ')'."""
-    depth = 0
-    for j in range(i, len(s)):
-        if s[j] == "(":
-            depth += 1
-        elif s[j] == ")":
-            depth -= 1
-            if depth == 0:
-                return j
-    return len(s) - 1
-
-
-def _balanced_brace(s, i):
-    """s[i] == '{' -> index of matching '}'."""
-    depth = 0
-    for j in range(i, len(s)):
-        if s[j] == "{":
-            depth += 1
-        elif s[j] == "}":
-            depth -= 1
-            if depth == 0:
-                return j
-    return len(s) - 1
 
 
 # ---------------------------------------------------------------------------
@@ -49,7 +30,7 @@ BAD_PROP_RE = re.compile(
       animation(-name|-duration|-delay|-iteration-count|-direction|-fill-mode|-play-state)? |
       -webkit-(?:transform|transition|animation|appearance|user-select|border-radius|box-shadow)(?:-.*)? |
       user-select | backface-visibility | perspective(-origin)? |
-      overflow-x | overflow-y | will-change | scroll-behavior |
+      will-change | scroll-behavior |
       gap | grid-template(-rows|-columns|-areas)? |
       grid-(?:row|column|area|gap|auto-flow) | place-items | place-content |
       object-fit | mix-blend-mode | filter | backdrop-filter | caret-color | resize |
@@ -67,407 +48,8 @@ BAD_SELECTOR_RE = re.compile(
 )
 
 
-def _strip_simple_nots(sel):
-    """Remove :not(<simple>) occurrences from a selector.  IE6 has no
-    :not() at all (an IE7+ feature), so e.g. MediaWiki's
-    `.mw-jump-link:not(:focus)` screen-reader hide trick would be dropped
-    rule-by-rule; stripping the pseudo lets the rule survive and apply to
-    every match.  Complex arguments are left in place so BAD_SELECTOR_RE
-    still catches them."""
-    out = sel
-    while True:
-        m = re.search(r":not\(", out)
-        if not m:
-            return out
-        j = m.end() - 1
-        k = _balanced_paren(out, j)
-        arg = out[j + 1:k].strip()
-        if re.fullmatch(r"[a-zA-Z][\w-]*|#[\w-]+|\.[\w-]+|:[a-z-]+", arg):
-            out = out[: m.start()] + out[k + 1 :]
-        else:
-            return out
 
 
-def _length_px(v):
-    m = re.fullmatch(r"\s*(-?[\d.]+)\s*(px|em|rem)?\s*", v)
-    if not m:
-        return None
-    n = float(m.group(1))
-    return n * 16 if m.group(2) in ("em", "rem") else n
-
-
-def _feature_true(feat):
-    """Evaluate one parenthesised media feature for the assumed viewport."""
-    f = feat.strip()
-    if f.lower().startswith("not "):
-        return not _feature_true(f[4:].strip().strip("()"))
-    dims = {"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT,
-            "device-width": VIEWPORT_WIDTH, "device-height": VIEWPORT_HEIGHT}
-    if ":" in f:
-        name, _, val = f.partition(":")
-        name, val = name.strip().lower(), val.strip().lower()
-        m = re.fullmatch(r"(min|max)-(.+)", name)
-        kind, base = (m.group(1), m.group(2)) if m else (None, name)
-        base = base.replace("-webkit-", "").replace("-moz-", "")
-        if base in dims:
-            px = _length_px(val)
-            if px is None:
-                return False
-            return (dims[base] >= px if kind == "min"
-                    else dims[base] <= px if kind == "max"
-                    else dims[base] == px)
-        if base in ("resolution", "device-pixel-ratio"):
-            rm = re.fullmatch(r"([\d.]+)\s*(dppx|dpi|x)?", val)
-            if not rm:
-                return False
-            n = float(rm.group(1))
-            if rm.group(2) == "dpi":
-                n /= 96.0
-            return (1 >= n if kind == "min" else 1 <= n if kind == "max"
-                    else n == 1)
-        table = {
-            ("orientation", "landscape"): True,
-            ("hover", "hover"): True, ("any-hover", "hover"): True,
-            ("pointer", "fine"): True, ("any-pointer", "fine"): True,
-            ("prefers-color-scheme", "light"): True,
-            ("prefers-reduced-motion", "no-preference"): True,
-            ("prefers-contrast", "no-preference"): True,
-            ("prefers-reduced-transparency", "no-preference"): True,
-            ("display-mode", "browser"): True,
-            ("update", "fast"): True, ("scripting", "none"): True,
-        }
-        return table.get((name, val), False)
-    # range syntax: (width >= 1120px), (400px <= width <= 800px)
-    parts = re.split(r"\s*(<=|>=|<|>|=)\s*", f)
-    if len(parts) >= 3:
-        ops = parts[1::2]
-        vals = parts[0::2]
-        cmp = {"<": lambda a, b: a < b, "<=": lambda a, b: a <= b,
-               ">": lambda a, b: a > b, ">=": lambda a, b: a >= b,
-               "=": lambda a, b: a == b}
-        nums = []
-        for v in vals:
-            nums.append(dims[v.strip().lower()] if v.strip().lower() in dims
-                        else _length_px(v))
-        if None in nums:
-            return False
-        return all(cmp[o](nums[i], nums[i + 1]) for i, o in enumerate(ops))
-    return f.lower() in ("color", "hover", "any-hover", "pointer",
-                         "any-pointer")  # boolean-context features
-
-
-def _media_query_true(query):
-    """Does a media query list (comma = or) match the assumed viewport?"""
-    for q in query.split(","):
-        q = q.strip().lower()
-        if not q:
-            return True
-        neg = False
-        if q.startswith("not "):
-            neg, q = True, q[4:].strip()
-        q = re.sub(r"^only\s+", "", q)
-        mt = re.match(r"([a-z-]+)", q)
-        mtype = mt.group(1) if mt and mt.group(1) not in ("and", "not") \
-            else "all"
-        ok = mtype in ("all", "screen")
-        i = 0
-        while ok and i < len(q):
-            if q[i] == "(":
-                j = _balanced_paren(q, i)
-                ok = _feature_true(q[i + 1:j])
-                i = j + 1
-            else:
-                i += 1
-        if ok != neg:
-            return True
-    return False
-
-
-def _resolve_media(css):
-    """Evaluate @media blocks against the assumed desktop viewport: matching
-    blocks are unwrapped in place, the others removed.  (IE6 knows no @media,
-    and stripping them all loses the desktop layout that modern sites define
-    in min-width queries.)  `@supports not (...)` fallbacks are unwrapped as
-    well -- IE6 supports nothing -- and the other @supports blocks dropped."""
-    pat = re.compile(r"@(media|supports)\b([^{;]*)\{", re.I)
-    pos = 0
-    while True:
-        m = pat.search(css, pos)
-        if not m:
-            return css
-        j = _balanced_brace(css, m.end() - 1)
-        if m.group(1).lower() == "media":
-            keep = _media_query_true(m.group(2))
-        else:
-            keep = m.group(2).strip().lower().startswith("not ")
-        if keep:
-            css = css[:m.start()] + css[m.end():j] + css[j + 1:]
-            pos = m.start()  # re-scan the unwrapped contents
-        else:
-            css = css[:m.start()] + css[j + 1:]
-            pos = m.start()
-
-
-def _strip_at_blocks(css, names):
-    pat = re.compile(r"@(?:" + "|".join(names) + r")\b[^{]*\{", re.I)
-    while True:
-        m = pat.search(css)
-        if not m:
-            return css
-        j = _balanced_brace(css, m.end() - 1)
-        css = css[: m.start()] + " " + css[j + 1 :]
-
-
-_NAMED_COLORS = {
-    "black": "#000000", "white": "#ffffff", "red": "#ff0000",
-    "green": "#008000", "lime": "#00ff00", "blue": "#0000ff",
-    "yellow": "#ffff00", "orange": "#ffa500", "purple": "#800080",
-    "gray": "#808080", "grey": "#808080", "silver": "#c0c0c0",
-    "maroon": "#800000", "navy": "#000080", "teal": "#008080",
-    "olive": "#808000", "aqua": "#00ffff", "cyan": "#00ffff",
-    "magenta": "#ff00ff", "fuchsia": "#ff00ff",
-}
-
-
-def _parse_color(color):
-    """Color -> (rrggbb, aa) lowercase hex pairs, or None."""
-    c = color.strip().lower()
-    if c in _NAMED_COLORS:
-        return _NAMED_COLORS[c][1:], "ff"
-    m = re.match(r"rgba?\(\s*(\d+),\s*(\d+),\s*(\d+)\s*(?:[,/]\s*([\d.]+%?)?)?\s*\)$", c)
-    if m:
-        rrggbb = "%02x%02x%02x" % tuple(min(255, int(x)) for x in m.groups()[:3])
-        a = m.group(4)
-        if a is None:
-            aa = "ff"
-        else:
-            av = float(a.rstrip("%"))
-            av = av / 100.0 if a.endswith("%") else av
-            aa = "%02x" % round(av * 255)
-        return rrggbb, aa
-    m = re.fullmatch(r"#([0-9a-f]{6})([0-9a-f]{2})", c)  # #rrggbbaa
-    if m:
-        return m.group(1), m.group(2)
-    if re.fullmatch(r"#[0-9a-f]{6}", c):
-        return c[1:], "ff"
-    m = re.fullmatch(r"#([0-9a-f]{3})([0-9a-f])", c)  # #rgba
-    if m:
-        return "".join(ch * 2 for ch in m.group(1)), m.group(2) * 2
-    if re.fullmatch(r"#[0-9a-f]{3}", c):
-        return "".join(ch * 2 for ch in c[1:]), "ff"
-    return None
-
-
-def _to_hex(color):
-    """Color -> #rrggbb (alpha dropped); for CSS properties."""
-    p = _parse_color(color)
-    return "#" + p[0] if p else None
-
-
-def _to_argb(color):
-    """Color -> #aarrggbb; the DXImageTransform filters (Gradient,
-    DropShadow, Shadow) silently fail on 6-digit #rrggbb strings."""
-    p = _parse_color(color)
-    return "#" + p[1] + p[0] if p else None
-
-
-def _px(value):
-    m = re.match(r"\s*(-?[\d.]+)px", value)
-    return float(m.group(1)) if m else 0.0
-
-
-_COLOR_RE = r"(#[0-9a-fA-F]{3,8}\b|rgba?\([^)]*\)|%s\b)" % "|".join(_NAMED_COLORS)
-
-
-def _gradient_filter(value):
-    """IE6 DX gradient filter approximating a CSS gradient.
-
-    Returns (filter_value, first_color) or None. Only the two end colors and
-    the nearest of the four cardinal directions can be represented.
-    """
-    matches = list(re.finditer(r"(?:linear|radial)-gradient\(", value))
-    if not matches:
-        return None
-    # With multiple comma-separated background layers, CSS paints the first
-    # listed one on top.  We can only emit one filter, so use the LAST
-    # gradient (the opaque base layer) and ignore translucent overlays.
-    m = matches[-1]
-    i = value.index("(", m.start())
-    j = _balanced_paren(value, i)
-    inner = value[i + 1 : j]
-    colors = re.findall(_COLOR_RE, inner)
-    if not colors:
-        return None
-    first, last = colors[0], colors[-1]
-    angle = _gradient_angle(inner)
-    # DX GradientType: 0 = left->right, 1 = top->bottom.
-    # CSS: 0deg=to top, 90=to right, 180=to bottom, 270=to left; the first
-    # color sits at the origin end of the gradient line.
-    if angle in (90, 270):  # horizontal
-        gtype = 0
-        start, end = (first, last) if angle == 90 else (last, first)
-    else:  # vertical
-        gtype = 1
-        start, end = (first, last) if angle == 180 else (last, first)
-    filt = (
-        "progid:DXImageTransform.Microsoft.Gradient(GradientType=%d,"
-        " StartColorStr='%s', EndColorStr='%s')" % (gtype, _to_argb(start), _to_argb(end))
-    )
-    return filt, first
-
-
-def _gradient_angle(inner):
-    """Direction of a gradient's argument list, snapped to a cardinal
-    (0=to top, 90=to right, 180=to bottom, 270=to left)."""
-    am = re.match(r"\s*(?:to\s+(right|left|top|bottom)|(-?[\d.]+)deg?)", inner)
-    angle = 0.0  # CSS default direction is "to top"
-    if am:
-        if am.group(1):
-            angle = {"top": 0, "right": 90, "bottom": 180, "left": 270}[am.group(1)]
-        else:
-            angle = float(am.group(2)) % 360
-    else:
-        # radial-gradient(... at <pos>): the color radiates from <pos>, so
-        # the linear approximation points away from it.
-        pm = re.search(
-            r"\bat\s+((?:top|bottom)\s+(?:left|right)|(?:left|right)\s+"
-            r"(?:top|bottom)|top|bottom|left|right)",
-            inner, re.I,
-        )
-        if pm:
-            pos = re.sub(r"\s+", " ", pm.group(1).lower())
-            angle = {
-                "top": 180, "bottom": 0, "left": 90, "right": 270,
-                "top left": 225, "left top": 225,
-                "top right": 45, "right top": 45,
-                "bottom left": 135, "left bottom": 135,
-                "bottom right": 315, "right bottom": 315,
-            }[pos]
-    # snap to nearest cardinal, circularly (350deg -> 0, not 270)
-    return min(
-        (0, 90, 180, 270),
-        key=lambda a: min(abs(a - angle), 360 - abs(a - angle)),
-    )
-
-
-def _gradient_stop_positions(inner):
-    """[(position, color)] for each color stop in a gradient's argument list.
-    Position is (value, unit-or-None) of the token FOLLOWING the color
-    (CSS syntax: `<color> <position>`), or None when implicit."""
-    matches = list(re.finditer(_COLOR_RE, inner))
-    stops = []
-    for k, cm in enumerate(matches):
-        end = matches[k + 1].start() if k + 1 < len(matches) else len(inner)
-        pm = re.match(r"\s*([\d.]+)(px|%)?", inner[cm.end():end])
-        stops.append(((pm.group(1), pm.group(2)) if pm else None, cm.group(0)))
-    return stops
-
-
-def _hairline_decls(value, body):
-    """IE6 declarations for gradients that are really hairlines, so the whole
-    element isn't painted with a full-surface gradient.
-
-    Two shapes occur in real-world CSS (e.g. MediaWiki Vector tab bars):
-      * `linear-gradient(to top, #77c1f6 0, #e8f2f8 1px, #fff 100%)` -- a
-        solid color with a 1px line of another color at one edge; becomes a
-        solid background-color + 1px border on that edge.
-      * a gradient shrunk to a 1px line via `background-size:1px 100%`
-        (or `100% 1px`) with no-repeat -- a tab separator; becomes a 1px
-        border on the corresponding edge.
-    Returns a list of declarations, or None when the gradient is a real
-    full-surface one.
-    """
-    matches = list(re.finditer(r"(?:linear|radial)-gradient\(", value))
-    if not matches:
-        return None
-    m = matches[-1]
-    i = value.index("(", m.start())
-    j = _balanced_paren(value, i)
-    inner = value[i + 1 : j]
-    angle = _gradient_angle(inner)
-    stops = _gradient_stop_positions(inner)
-    if len(stops) < 2:
-        return None
-
-    def is_zero(pos):
-        return pos is None or float(pos[0]) == 0
-
-    def px_of(pos):
-        if pos is None or pos[1] not in (None, "px"):
-            return None
-        return float(pos[0])
-
-    def opaque(color):
-        p = _parse_color(color)
-        return p if p and p[1] != "00" else None
-
-    # Shape 1: 1px-wide/tall background-size -> border on that edge.
-    sizes = None
-    sm = re.search(r"(?<![\w-])background-size\s*:\s*([^;]+)", body, re.I)
-    if sm:
-        sizes = sm.group(1).split()
-    else:
-        zm = re.search(r"/\s*([^;/]+)\s*$", value.strip())
-        if zm:  # shorthand: background: ... / 1px 100%
-            sizes = zm.group(1).split()
-    if sizes:
-        w, h = sizes[0], (sizes[1] if len(sizes) > 1 else sizes[0])
-        color = None
-        for c in (stops[-1][1], stops[0][1]):
-            color = opaque(c)
-            if color:
-                break
-        if color:
-            if w == "1px" and h != "1px":  # vertical line, right edge
-                return ["border-right: 1px solid #%s" % color[0]]
-            if h == "1px" and w != "1px":  # horizontal line
-                edge = "bottom" if angle == 180 else "top"
-                return ["border-%s: 1px solid #%s" % (edge, color[0])]
-
-    # Shape 2: first stop at 0, second within 2px, last at 100% -> solid
-    # color with a 1px line of the first color at the starting edge.
-    last = stops[-1][0]
-    last_at_end = last is None or (last[1] == "%" and float(last[0]) == 100)
-    if not (is_zero(stops[0][0]) and last_at_end):
-        return None
-    second = px_of(stops[1][0])
-    if second is None or second > 2:
-        return None
-    solid = opaque(stops[-1][1])
-    line = opaque(stops[0][1]) or opaque(stops[1][1])
-    if not solid:
-        return None
-    edge = {0: "bottom", 180: "top", 90: "left", 270: "right"}[angle]
-    decls = ["background-color: #%s" % solid[0]]
-    if line:
-        decls.append("border-%s: 1px solid #%s" % (edge, line[0]))
-    return decls
-
-
-def _shadow_filter(value):
-    """IE6 shadow filter from the first box-shadow/text-shadow.
-
-    Blurred shadows (the third length > 0) use the soft 'Shadow' filter;
-    sharp ones use the hard-edged 'DropShadow'.  A zero-offset DropShadow
-    is invisible behind an opaque element, so glows must use 'Shadow'.
-    """
-    if "inset" in value.lower():
-        return None
-    # strip color tokens first so hex digits aren't read as lengths;
-    # offsets are often unitless ("0 0 10px #000")
-    lengths = re.findall(r"-?[\d.]+(?:px|em)?", re.sub(_COLOR_RE, " ", value))
-    color_m = re.search(_COLOR_RE, value)
-    if len(lengths) < 2 or not color_m:
-        return None
-    hexc = _to_argb(color_m.group(1))
-    if not hexc:
-        return None
-    blur = _px(lengths[2]) if len(lengths) > 2 else 0.0
-    name = "Shadow" if blur > 0 else "DropShadow"
-    return (
-        "progid:DXImageTransform.Microsoft.%s("
-        "OffX=%g,OffY=%g,Color='%s')" % (name, _px(lengths[0]), _px(lengths[1]), hexc)
-    )
 
 
 _LIST_STYLE_TYPES = (
@@ -499,53 +81,27 @@ def _expand_list_style(value):
 
 
 def _expand_font(value):
-    """Expand a `font` shorthand into longhand declarations.
-
-    IE6's font shorthand is broken -- notably `font: inherit` (used by
-    MediaWiki's `.mw-heading h1..h6` rule) resets font-size to the UA
-    default, so every h2 renders at 2em, bigger than the h1s.  Longhand
-    `font-size: inherit` etc. behave correctly, so the shorthand never
-    passes through to the browser."""
+    """Expand unsupported font:inherit; preserve ordinary font shorthand."""
     v = value.strip()
     if v == "inherit":
         return ["font-family: inherit", "font-size: inherit",
                 "font-weight: inherit", "font-style: inherit",
                 "line-height: inherit"]
-    style = weight = size = line = None
-    family = []
-    for t in v.split():
-        if t in ("italic", "oblique"):
-            style = t
-        elif t in ("bold", "bolder", "lighter") or re.fullmatch(r"\d{3}", t):
-            weight = t
-        elif re.search(r"[\d.]", t) and re.search(r"[a-z%]", t, re.I):
-            if "/" in t and line is None:
-                size, line = t.split("/", 1)
-            elif size is None:
-                size = t
-        else:
-            family.append(t.rstrip(","))
-    out = []
-    if style:
-        out.append("font-style: %s" % style)
-    if weight:
-        out.append("font-weight: %s" % weight)
-    if size:
-        out.append("font-size: %s" % size)
-    if line:
-        out.append("line-height: %s" % line)
-    if family:
-        out.append("font-family: %s" % ",".join(family))
-    return out
+    # Font shorthand itself is supported (reference §4.3). Splitting it on
+    # whitespace corrupts quoted families, keyword sizes and system fonts,
+    # and loses the shorthand's reset of omitted style/weight properties.
+    return ["font: %s" % v]
 
 
 def _transform_decls(body):
     """Down-grade one declaration block to IE6.
 
-    Modern effects are approximated with DXImageTransform filters and CSS
-    expressions (both IE6/7-only features); the rest is dropped.
+    Modern effects are approximated with DXImageTransform filters.
+    Layout measurements run separately on load/resize, never in generated
+    CSS expressions.
     """
     filters = []
+    opacity = None
     decls = []
     fixed = False
     jc = re.search(r"justify-content\s*:\s*([^;]+)", body, re.I)
@@ -556,7 +112,7 @@ def _transform_decls(body):
         prop, _, val = d.partition(":")
         p = prop.strip().lower()
         v = val.strip()
-        if p == "font":  # IE6's broken shorthand; expand to longhand
+        if p == "font":
             decls.extend(_expand_font(v))
             continue
         if p == "list-style":  # IE6's shorthand doesn't reset list-style-image
@@ -568,15 +124,19 @@ def _transform_decls(body):
             decls.append("list-style-image: none")
             continue
         if p == "opacity":
-            try:
-                filters.append("alpha(opacity=%d)" % round(float(v) * 100))
-            except ValueError:
-                pass
+            match = re.fullmatch(r"([+-]?(?:\d+(?:\.\d*)?|\.\d+))(%?)\s*(!\s*important)?", v, re.I)
+            if match:
+                amount = float(match[1]) / (100 if match[2] else 1)
+                important = bool(match[3])
+                if opacity is None or important or not opacity[1]:
+                    opacity = (min(1, max(0, amount)), important)
             continue
         if p in ("box-shadow", "text-shadow"):
-            f = _shadow_filter(v)
-            if f:
-                filters.append(f)
+            # DX shadows filter the entire element (including its text),
+            # not just the CSS shadow layer. They distort text rendering and
+            # cannot reproduce centered blurred glows. Omit the effect rather
+            # than forcing hasLayout and changing link rendering on hover.
+            # Do not emit filter:none: that would cancel gradients/opacity.
             continue
         if p in ("background", "background-image") and "/" in v:
             # `center / 16px url(..)`: the CSS3 position/size form invalidates
@@ -620,7 +180,8 @@ def _transform_decls(body):
         if p.startswith("-webkit-mask"):
             continue
         if p in ("filter", "-ms-filter"):
-            if "progid:" in v.lower():  # already an IE filter -- keep it
+            if "progid:" in v.lower() or re.fullmatch(r"none\s*(?:!\s*important)?", v, re.I):
+                # Explicit resets must cancel filters from earlier rules.
                 decls.append("%s: %s" % (prop.strip(), v))
             continue
         if BAD_PROP_RE.match(p):
@@ -646,19 +207,31 @@ def _transform_decls(body):
             # IE6 has no inline-block; inline is the closest degradation
             # (this is what makes font-size:0 + inline-block nav menus lay
             # out horizontally instead of stacking as block list-items).
-            v = "inline"
+            # A full-width inline-block (multi-column item idiom) is just a
+            # block, and `inline` would ignore the width.
+            v = "block" if re.search(
+                r"(?<![\w-])width\s*:\s*100%", body, re.I) else "inline"
+            decls.append("zoom: 1")  # HACK-INLINE-BLOCK: inline + hasLayout
         elif p == "position" and v.lower() in ("fixed", "sticky"):
             v = "absolute"
             fixed = True
         decls.append("%s: %s" % (prop.strip(), v))
+    if opacity is not None:
+        percent = round(opacity[0] * 100)
+        if percent < 100:
+            filters.append("alpha(opacity=%d)" % percent)
+        elif not filters:
+            # Even alpha(opacity=100) routes text through IE's filter
+            # renderer and can produce dark fringes. Clear the previous
+            # alpha filter explicitly (dropping the declaration would leave
+            # opacity:0 from a loading state in effect).
+            decls.append("filter: none" + (" !important" if opacity[1] else ""))
     # IE6 ignores max-width, and margin:auto only centres a block that has
     # an explicit width AND hasLayout.  Two consequences for the ubiquitous
     # "max-width + margin:auto" centring idiom (very common on <body> and on
     # fixed-width page columns): (1) max-width becomes a plain fixed width,
-    # and (2) a fixed width alone still does not give IE6 hasLayout, so the
-    # auto margins silently fail to centre and the column hugs the left --
-    # zoom:1 is the invisible, side-effect-free hasLayout trigger that makes
-    # them work.
+    # and (2) layout must be present. Width triggers it on blocks; zoom:1
+    # also covers elements whose display was changed during degradation.
     auto_center = re.search(
         r"(?<![\w-])margin(?:-left|-right)?\s*:\s*[^;]*\bauto\b", body, re.I)
     mw = re.search(r"(?<![\w-])max-width\s*:\s*([^;]+)", body, re.I)
@@ -672,10 +245,14 @@ def _transform_decls(body):
             decls.append("zoom: 1")
     # No extra work for fixed/sticky here: the element is absolute with its
     # static top/left kept, and the HTML step (_pin_fixed_elements) adds a
-    # JS scroll handler.  CSS expression() -- the classic IE6 "position:
-    # fixed" hack -- is ignored in the standards mode the proxy forces via
-    # the XHTML Strict doctype, so it can't do the pinning.
+    # JS scroll handler, avoiding repeatedly evaluated CSS expressions.
     decls = [d for d in map(_degrade_inherit, decls) if d]
+    # BUG-NEGATIVE-MARGIN-CLIP: IE6 clips content pulled outside its
+    # container by a negative horizontal margin; position:relative cures it.
+    if (re.search(r"(?<![\w-])margin(?:-left|-right)?\s*:[^;]*-\d", body,
+                  re.I)
+            and not re.search(r"(?<![\w-])position\s*:", body, re.I)):
+        decls.append("position: relative")
     # Image-replacement: `text-indent:-9999px` hides the label of a button
     # or link, but IE6 ignores text-indent on <input>, leaving the text
     # painted over the background.  A zero font-size hides it there too.
@@ -684,6 +261,13 @@ def _transform_decls(body):
         decls = [d for d in decls
                  if not re.match(r"\s*font-size\s*:", d, re.I)]
         decls.append("font-size: 0")
+    # IE6 doubles a float's margin at the containing edge. display:inline
+    # cures that bug without changing its floated box geometry. Preserve
+    # intentionally hidden elements.
+    fm = re.search(r"(?<![\w-])float\s*:\s*(left|right)\b", body, re.I)
+    if (fm and re.search(r"(?<![\w-])margin(?:-" + fm[1] + r")?\s*:", body, re.I)
+            and not re.search(r"display\s*:\s*none\b", body, re.I)):
+        decls.append("display: inline")
     # IE6 quirk: a later plain declaration overrides an earlier !important
     # one in the same rule, so de-duplicate per property, keeping the last
     # value but preferring the !important variant.
@@ -691,22 +275,27 @@ def _transform_decls(body):
     for d in decls:
         p, _, v = d.partition(":")
         key = p.strip().lower()
-        imp = v.strip().endswith("!important")
+        imp = bool(re.search(r"!\s*important\s*$", v, re.I))
         old = seen.get(key)
         if old is None or imp or not old[1]:
+            # Keep the winning declaration at its source position relative
+            # to shorthands that reset it (font vs font-weight, for example).
+            seen.pop(key, None)
             seen[key] = (d, imp)
     decls = [d for d, _ in seen.values()]
     if filters:
         # IE6 only honours the FIRST filter in a list -- keep the most
-        # visually significant one (gradient > shadow > opacity).
+        # visually significant one (gradient > opacity).
         def rank(f):
             fl = f.lower()
             if "gradient" in fl:
                 return 0
-            if "dropshadow" in fl:
-                return 1
-            return 2
-        decls.append("filter: %s" % min(filters, key=rank))
+            return 1
+        selected = min(filters, key=rank)
+        important = " !important" if selected.startswith("alpha(") and opacity and opacity[1] else ""
+        decls.append("filter: %s%s" % (selected, important))
+        if "zoom" not in seen:
+            decls.append("zoom: 1")  # filters require hasLayout (§4.4)
     return "; ".join(decls)
 
 
@@ -796,29 +385,15 @@ def _rewrite_css_urls(css, base, abs_base=None):
 
 
 def _degrade_selector(sel, synth=None):
-    """Approximate selector syntax IE6 cannot parse.
+    """Emulate static unsupported selectors using matching classes.
 
-    IE6 only understands element, #id, .class, * and the descendant
-    combinator (plus :link/:visited/:active/:hover on <a>); a rule
-    containing anything else is dropped by IE6 entirely.  The common cases
-    degrade cleanly to the closest supported form:
-
-      a > b          -> a b          (child -> descendant)
-      a + b, a ~ b,
-      :first-child   -> .ie6x<hash>  (synthetic class, see selectors.py)
-      el[attr]       -> .ie6x<hash>  (synthetic class the proxy adds to
-                                       the matching elements, see selectors)
-      el:first-child -> el           (apply to every match)
-      :root          -> html
-
-    Chained classes (.a.b, which IE6 reads as just .b) get the same synthetic
-    class treatment as attribute selectors.  :hover/:focus/:before/:after and the + / ~ sibling
-    combinators are left in place -- degrading them would mis-style, so IE6
-    simply drops those rules."""
+    Dynamic ancestor states that cannot be emulated remain unsupported,
+    rather than broadening the set of matching elements.
+    """
     sel = re.sub(r":root\b", "html", sel)
     sel = rewrite_selector(sel, synth)
-    # remaining child combinators degrade to descendant
-    sel = re.sub(r"\s*>\s*", " ", sel)
+    # A chain with an unhandled dynamic ancestor must stay unsupported;
+    # broadening a child selector to descendants changes which nodes match.
     # drops above can empty out a comma-list part (e.g. [type='button'])
     return ",".join(p for p in (s.strip() for s in sel.split(",")) if p)
 
@@ -833,18 +408,18 @@ _UNSUPPORTED_PSEUDO_RE = re.compile(
     r"first-of-type|last-of-type|only-of-type|lang\()", re.I)
 
 
-def _filter_rules(css, synth=None):
+def _filter_rules(css, synth=None, box_rules=None):
     def sub(m):
         sel, body = m.group(1), m.group(2)
         # comma-list parts IE6 can't evaluate are dropped individually
-        sel = ",".join(p for p in sel.split(",")
-                       if not _UNSUPPORTED_PSEUDO_RE.search(p))
+        sel = ",".join(p for p in split_selectors(sel)
+                       if not _UNSUPPORTED_PSEUDO_RE.search(p)
+                       and not BAD_SELECTOR_RE.search(p))
         if not sel.strip():
             return ""
+        if box_rules is not None and synth is not None:
+            record_box_rules(sel, body, synth, box_rules)
         sel = sel.replace("::", ":")  # IE6 uses single-colon pseudos
-        sel = _strip_simple_nots(sel)
-        if BAD_SELECTOR_RE.search(sel):
-            return ""
         sel = _degrade_selector(sel, synth)
         decls = _transform_decls(body)
         if not decls:
@@ -1009,7 +584,10 @@ def _collect_vars(css):
             if sel.startswith("@"):
                 walk(brace + 1, j)  # recurse into @media etc.
             else:
-                tgt = root_vars if ":root" in sel else other_vars
+                # A qualified root (e.g. :root.large) is conditional too.
+                tgt = (root_vars if any(p.strip() in (":root", "html")
+                                        for p in split_selectors(sel))
+                       else other_vars)
                 for vm in re.finditer(r"(--[\w-]+)\s*:\s*([^;{}]+)", body):
                     tgt[vm.group(1)] = vm.group(2).strip()
             i = j + 1
@@ -1030,37 +608,134 @@ def _resolve_vars(css):
     # html.skin-theme-clientpref-night or under prefers-color-scheme:dark),
     # which would otherwise clobber the default values.
     root_vars, other_vars = _collect_vars(css)
+    # Root preferences must not leak into the sheet-wide approximation.
+    # Vector defines --font-size-medium separately for Small/Standard/Large;
+    # pooling those definitions made every page use the last (Large) value.
+    # Materialize conditional declarations under the original root selector,
+    # so independently served stylesheets still follow the page's classes.
+    root_scopes = {}
+    for rule in re.finditer(r"([^{}]+)\{([^{}]*)\}", css):
+        definitions = dict(re.findall(r"(--[\w-]+)\s*:\s*([^;]+)", rule[2]))
+        if not definitions:
+            continue
+        for selector in split_selectors(rule[1]):
+            selector = selector.strip()
+            if re.fullmatch(r"(?:html|:root)(?:[.#][\w-]+)+", selector):
+                selector = re.sub(r"^:root", "html", selector)
+                root_scopes.setdefault(selector, {}).update(
+                    (k, v.strip()) for k, v in definitions.items())
+    conditional_names = {name for values in root_scopes.values() for name in values}
     sheet_vars = dict(other_vars)
+    for name in conditional_names:
+        sheet_vars.pop(name, None)
     sheet_vars.update(root_vars)
 
-    def sub(text, local):
+    def sub(text, local, inherited=None):
         env = dict(sheet_vars)
+        env.update(inherited or {})
         env.update(local)
+        cache, cyclic = {}, set()
+        budget = [4096]
 
-        def rep(m):
-            name, fb = m.group(1), m.group(2)
-            if name in env:
-                return env[name]
-            return fb.strip() if fb else ""
+        def variable(name, stack):
+            if name in stack:
+                cyclic.update(stack[stack.index(name):])
+                return None
+            if name not in env or len(stack) >= 64:
+                return None
+            if name not in cache:
+                value = expand(env[name], stack + (name,))
+                cache[name] = None if name in cyclic else value
+            return cache[name]
 
-        prev = None
-        while prev != text:  # values may reference other vars
-            prev = text
-            text = re.sub(
-                r"var\(\s*(--[\w-]+)\s*(?:,\s*([^)]*))?\)", rep, text)
-        return re.sub(r"(^|;)\s*--[\w-]+\s*:\s*[^;]+",
-                      lambda m: m.group(1), text)
+        def expand(value, stack=(), depth=0):
+            # Bound both recursion and output: doubling references can grow
+            # exponentially even without a cycle. Invalid values use the
+            # caller's var() fallback or discard the declaration.
+            if depth >= 64:
+                return None
+            pieces, pos, size = [], 0, 0
+            var_pattern = re.compile(r"var\(", re.I)
+            while True:
+                m = var_pattern.search(value, pos)
+                if not m:
+                    tail = value[pos:]
+                    return "".join(pieces) + tail if size + len(tail) <= 65536 else None
+                budget[0] -= 1
+                if budget[0] < 0:
+                    return None
+                end = _balanced_paren(value, m.end() - 1)
+                if value[end:end + 1] != ")":
+                    return None
+                name, comma, fallback = value[m.end():end].partition(",")
+                replacement = variable(name.strip(), stack)
+                if replacement is None and comma:
+                    replacement = expand(fallback.strip(), stack, depth + 1)
+                if replacement is None:
+                    return None
+                prefix = value[pos:m.start()]
+                size += len(prefix) + len(replacement)
+                if size > 65536:
+                    return None
+                pieces.extend((prefix, replacement))
+                pos = end + 1
+
+        out = []
+        for declaration in text.split(";"):
+            prop, colon, value = declaration.partition(":")
+            if not colon or prop.strip().startswith("--"):
+                continue
+            resolved = expand(value)
+            if resolved is not None:
+                out.append(prop + ":" + resolved)
+        return ";".join(out)
 
     def walk(m):
         sel, body = m.group(1), m.group(2)
         local = dict(re.findall(r"(--[\w-]+)\s*:\s*([^;]+)", body))
         local = {k: v.strip() for k, v in local.items()}
-        return sel + "{" + sub(body, local) + "}"
+        out = [sel + "{" + sub(body, local) + "}"]
+        # Only variable-dependent declarations need conditional variants;
+        # copying the whole rule would boost unrelated properties' specificity.
+        declarations = [d for d in body.split(";")
+                        if "var(" in d and not d.strip().startswith("--")]
+        if not declarations:
+            return "\n".join(out)
+        for scope, values in root_scopes.items():
+            changed_props = set()
+            for declaration in declarations:
+                value = sub(declaration, local, values)
+                if value and value != sub(declaration, local):
+                    changed_props.add(declaration.partition(":")[0].strip().lower())
+            if not changed_props:
+                continue
+            # Keep duplicate declarations and font shorthands in source
+            # order. A literal font-size after var() must still win.
+            font_changed = any(p == "font" or p.startswith("font-")
+                               for p in changed_props)
+            changed = []
+            for declaration in body.split(";"):
+                prop = declaration.partition(":")[0].strip().lower()
+                if (prop in changed_props or
+                        (font_changed and (prop == "font" or prop.startswith("font-")))):
+                    value = sub(declaration, local, values)
+                    if value:
+                        changed.append(value)
+            selectors = []
+            for part in split_selectors(sel):
+                part = part.strip()
+                # html cannot descend from html. Intersect conditions on
+                # the root itself; ordinary targets become descendants.
+                root = re.match(r"^(?:html|:root)(?=[.#:\s>+~\[]|$)", part)
+                selectors.append(scope + part[root.end():] if root
+                                 else scope + " " + part)
+            out.append(",".join(selectors) + "{" + ";".join(changed) + "}")
+        return "\n".join(out)
 
     return re.sub(r"([^{}]+)\{([^{}]*)\}", walk, css)
 
 
-def transform_css(css, base, abs_base=None, synth=None):
+def transform_css(css, base, abs_base=None, synth=None, box_rules=None):
     css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
     css = _resolve_media(css)
     css = _flatten_css(css)
@@ -1090,15 +765,18 @@ def transform_css(css, base, abs_base=None, synth=None):
 
     def _hsl(m):
         h, s, l = (
-            float(m.group(1)) / 360.0,
-            float(m.group(2)) / 100.0,
-            float(m.group(3)) / 100.0,
+            (float(m.group(1)) % 360) / 360.0,
+            min(1, max(0, float(m.group(2)) / 100.0)),
+            min(1, max(0, float(m.group(3)) / 100.0)),
         )
         r, g, b = colorsys.hls_to_rgb(h, l, s)
-        return "rgb(%d,%d,%d)" % (round(r * 255), round(g * 255), round(b * 255))
+        alpha = "," + m.group(4) if m.group(4) else ""
+        return "rgb(%d,%d,%d%s)" % (round(r * 255), round(g * 255), round(b * 255), alpha)
 
     css = re.sub(
-        r"hsla?\(\s*([\d.]+)\s*,\s*([\d.]+)%\s*,\s*([\d.]+)%", _hsl, css
+        r"hsla?\(\s*(-?\d*\.?\d+)\s*,\s*(\d*\.?\d+)%\s*,"
+        r"\s*(\d*\.?\d+)%\s*(?:,\s*(\d*\.?\d+%?)\s*)?\)",
+        _hsl, css, flags=re.I
     )
     css = _replace_light_dark(css)
     css = _replace_calc(css)
@@ -1122,7 +800,7 @@ def transform_css(css, base, abs_base=None, synth=None):
         css,
     )
     css = _rewrite_css_urls(css, base, abs_base)
-    css = _filter_rules(css, synth)
+    css = _filter_rules(css, synth, box_rules)
     return css
 
 

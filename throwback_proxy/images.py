@@ -84,7 +84,9 @@ def _svg_to_png(data, width=None):
         if width:
             # -resize is an operation, so it must follow the input image
             cmd += ["-resize", "%dx" % width]
-        cmd += ["png:-"]
+        # Drop conversion-time metadata so identical icons have stable
+        # downstream bytes/ETags, including when Pillow isn't installed.
+        cmd += ["-strip", "png:-"]
         r = subprocess.run(
             cmd,
             input=data, capture_output=True, timeout=15,

@@ -1,6 +1,7 @@
 """The HTTP proxy server: request handling, HTTPS downgrading, ad blocking,
 and dispatching responses to the HTML/CSS/image rewriters."""
 
+import hashlib
 import os
 import re
 import ssl
@@ -10,18 +11,20 @@ import tempfile
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler
-from html import unescape as html_unescape
 from urllib.parse import urljoin, urlparse
 
-from .ads import _is_ad_url
+from .compat import apply_mediawiki_fallbacks
 from .config import (DEFAULT_PORT, FIX_IE_CSS_LIMIT_JS,
                      FIX_IE_CSS_LIMIT_PATH, HOST, TRANSPARENT_GIF,
                      XHTML_STRICT_DOCTYPE)
 from .css import _body_gradient_filter, _resolve_media, transform_css
 from .fetch import http_get, http_get_cached
-from .html import transform_html
+from .html import document_styles, transform_html
 from .images import _ie6_png, _svg_to_png, _webp_to_png
-from .layout import (FlexClasses, _apply_style_edits, _bg_image_classes,
+from .markup import protect_raw_text
+from .metrics import inject_box_sizing
+from .layout import (FlexClasses, _apply_max_widths, _apply_style_edits,
+                     _max_width_classes, _bg_image_classes, _multicolumn_layout,
                      _bg_image_elements, _bottom_pin_elements,
                      _clearfix_floated_parents, _container_metrics,
                      _flex_container_classes, _flex_row_layout,
@@ -32,7 +35,7 @@ from .layout import (FlexClasses, _apply_style_edits, _bg_image_classes,
                      _pinned_classes, _row_container_widths,
                      _viewport_classes, _viewport_elements)
 from .selectors import apply_synthetic_classes
-from .urls import from_proxy, to_proxy
+from .urls import _is_ad_url, from_proxy, to_proxy
 
 
 try:
@@ -113,6 +116,8 @@ class _CssHints:
         self.body_filter = None
         self.css_chunks = []
         self.synth = {}  # synthetic-class specs (see selectors.py)
+        self.max_widths = {}
+        self.box_rules = []
 
     def scan(self, css, base, abs_base):
         # only the rules that apply at the assumed viewport are hints
@@ -131,12 +136,55 @@ class _CssHints:
         # on the TRANSFORMED css: the image url may live in a var() that
         # only flattening/resolution exposes
         self.bg.update(_bg_image_classes(
-            transform_css(css, base, abs_base, self.synth)))
+            transform_css(css, base, abs_base, self.synth, self.box_rules)))
         self.bottom |= _margin_auto_classes(css)
         self.float_classes |= _float_classes(css)
         self.full_width |= _full_width_classes(css)
         self.row_widths.update(_row_container_widths(css))
+        self.max_widths.update(_max_width_classes(css))
         self.body_filter = self.body_filter or _body_gradient_filter(css)
+
+    def finish(self):
+        # Recompute layout state across sheet boundaries: a later inline
+        # rule can cancel display:flex declared in an earlier linked sheet.
+        css = "\n".join(self.css_chunks)
+        self.flex_classes = _flex_container_classes(css)
+        self.grid_containers, self.grid_areas = _grid_column_classes(css)
+
+
+def _page_css_hints(text, url, abs_base):
+    base, sources = document_styles(text, url)
+    sheets = {}
+    for kind, value in sources:
+        if kind == "external":
+            target = urljoin(base, value)
+            if urlparse(target).scheme in ("http", "https") and not _is_ad_url(target):
+                sheets[target] = None
+    if sheets:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = pool.map(lambda u: http_get_cached(u, timeout=5), sheets)
+            for target, result in zip(sheets, results):
+                sheets[target] = result
+    hints = _CssHints()
+    for kind, value in sources:
+        if kind == "inline":
+            hints.scan(value, base, abs_base)
+        else:
+            target = urljoin(base, value)
+            result = sheets.get(target)
+            if result and result[0] == 200:
+                _, headers, data = result
+                ctype = headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+                if ctype == "text/css":
+                    hints.scan(_decode(data, _charset(headers)), target, abs_base)
+    hints.finish()
+    return base, hints
+
+
+def _charset(headers):
+    m = re.search(r"charset\s*=\s*[\"']?([\w-]+)",
+                  headers.get("Content-Type", ""), re.I)
+    return m.group(1) if m else None
 
 
 def _decode(body, declared):
@@ -155,6 +203,18 @@ def _decode(body, declared):
             return body.decode(c, errors="replace")
         except LookupError:
             continue
+
+
+def _image_cache_headers(headers, body):
+    """Cache downstream image bytes without reusing an upstream SVG ETag."""
+    result = {key: headers[key] for key in
+              ('Cache-Control', 'Expires', 'Last-Modified', 'Vary', 'Age')
+              if key in headers}
+    if 'Cache-Control' not in result and 'Expires' not in result:
+        result['Cache-Control'] = ('no-cache' if headers.get('Pragma', '').lower() == 'no-cache'
+                                   else 'private, max-age=60')
+    result['ETag'] = '"ie6-' + hashlib.sha256(body).hexdigest() + '"'
+    return result
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -192,7 +252,7 @@ class Handler(BaseHTTPRequestHandler):
         original absolute URLs instead of wrapping them in the proxy path
         scheme -- the browser routes all http traffic through us anyway."""
         return "http://%s:%d" % (
-            self.client_address[0], self.server.server_address[1]
+            self.connection.getsockname()[0], self.server.server_address[1]
         )
 
     # -- helpers ------------------------------------------------------------
@@ -243,8 +303,12 @@ class Handler(BaseHTTPRequestHandler):
         self._safe_handle(head_only=True)
 
     def do_POST(self):
+        # The unread request body must not become the next request on this
+        # HTTP/1.1 connection.
+        self.close_connection = True
         self._send("<html><body>POST is not proxied by Throwback Proxy.</body></html>",
-                   "text/html", 405)
+                   "text/html", 405, extra={"Allow": "GET, HEAD",
+                                            "Connection": "close"})
 
     def do_CONNECT(self):
         # System-proxy mode: the browser tunnels an HTTPS site through us.
@@ -377,9 +441,8 @@ class Handler(BaseHTTPRequestHandler):
             loc = urljoin(url, headers["Location"])
             self._redirect(to_proxy(loc, abs_base))
             return
-        ctype = headers.get("Content-Type", "application/octet-stream").split(";")[0].strip()
-        charset_m = re.search(r"charset=([\w-]+)", headers.get("Content-Type") or "", re.I)
-        charset = charset_m.group(1).lower() if charset_m else None
+        ctype = headers.get("Content-Type", "application/octet-stream").split(";")[0].strip().lower()
+        charset = _charset(headers)
         extra = {}
         if headers.get("Content-Disposition"):
             extra["Content-Disposition"] = headers["Content-Disposition"]
@@ -391,30 +454,7 @@ class Handler(BaseHTTPRequestHandler):
             text = _decode(body, charset)
             # Find row-flex containers (from <style> blocks and linked
             # stylesheets) so their children can be laid out side by side.
-            hints = _CssHints()
-            for sm in re.finditer(r"<style\b[^>]*>(.*?)</style\s*>",
-                                  text, re.I | re.S):
-                hints.scan(sm.group(1), url, abs_base)
-            sheets = []
-            for lm in re.finditer(r"<link\b[^>]*>", text, re.I):
-                tag = lm.group(0)
-                if not re.search(r'rel\s*=\s*["\']?stylesheet', tag, re.I):
-                    continue
-                hm = re.search(r'href\s*=\s*["\']([^"\']+)["\']', tag, re.I)
-                if not hm:
-                    continue
-                su = re.sub(r"^https://", "http://",
-                            urljoin(url, html_unescape(hm.group(1))))
-                if not _is_ad_url(su):
-                    sheets.append(su)
-            # fetched concurrently: a page can link dozens of stylesheets
-            if sheets:
-                with ThreadPoolExecutor(max_workers=8) as pool:
-                    fetched = list(pool.map(
-                        lambda u: http_get_cached(u, timeout=5)[2], sheets))
-                for su, sdata in zip(sheets, fetched):
-                    if sdata:
-                        hints.scan(_decode(sdata, None), su, abs_base)
+            document_base, hints = _page_css_hints(text, url, abs_base)
             flex_classes, widths = hints.flex_classes, hints.widths
             grid_containers, grid_areas = hints.grid_containers, hints.grid_areas
             pinned, vp, bg = hints.pinned, hints.vp, hints.bg
@@ -425,17 +465,20 @@ class Handler(BaseHTTPRequestHandler):
             # page's own tag names and attribute values
             text = apply_synthetic_classes(text, hints.synth)
             text = transform_html(text, url, abs_base)
+            text, restore_scripts = protect_raw_text(
+                text, tags=("script", "textarea", "title"))
 
             def _style_block(m):
-                return "<style>%s</style>" % transform_css(
-                    m.group(1), url, abs_base)
+                return "%s%s</style>" % (m.group(1), transform_css(
+                    m.group(2), document_base, abs_base))
 
             # Inline <style> blocks need the same treatment as linked
             # stylesheets (nmac.me-style external CSS alone never exposed
             # this; sites with inline CSS like example.com do).
             text = re.sub(
-                r"<style\b[^>]*>(.*?)</style\s*>",
+                r"(<style\b[^>]*>)(.*?)</style\s*>",
                 _style_block, text, flags=re.I | re.S)
+            text, restore_raw = protect_raw_text(text)
             text = _bg_image_elements(text, bg, url, abs_base)
             if body_filter:
                 # IE6 can't filter body: paint the gradient on a pinned,
@@ -456,6 +499,8 @@ class Handler(BaseHTTPRequestHandler):
             text = _flex_row_layout(text, flex_classes, widths, pinned,
                                     full_width, row_widths)
             text = _grid_row_layout(text, grid_containers, grid_areas)
+            text = _multicolumn_layout(text, "\n".join(css_chunks))
+            text = _apply_max_widths(text, hints.max_widths, widths)
             text = _apply_style_edits(text, _clearfix_floated_parents(
                 text, float_classes))
             text = _pin_fixed_elements(text, pinned)
@@ -463,7 +508,9 @@ class Handler(BaseHTTPRequestHandler):
             text = _bottom_pin_elements(
                 text, bottom, pinned,
                 _container_metrics("\n".join(css_chunks), pinned))
-            self._send(text, "text/html", status, head_only, extra)
+            text = inject_box_sizing(text, hints.box_rules)
+            text = apply_mediawiki_fallbacks(text)
+            self._send(restore_scripts(restore_raw(text)), "text/html", status, head_only, extra)
             return
         if ctype == "text/css":
             text = transform_css(_decode(body, charset), url, abs_base)
@@ -474,7 +521,7 @@ class Handler(BaseHTTPRequestHandler):
             png = _webp_to_png(body)
             if png:
                 body, ctype, converted = png, "image/png", True
-        if (ctype == "image/svg+xml" or url.lower().endswith(".svg")) \
+        if status == 200 and (ctype == "image/svg+xml" or urlparse(url).path.lower().endswith(".svg")) \
                 and _svg_to_png:
             png = _svg_to_png(body, svg_width)
             if png:
@@ -482,6 +529,19 @@ class Handler(BaseHTTPRequestHandler):
         if ctype == "image/png" and _ie6_png and not converted:
             # 32-bit alpha PNGs render with gray/black backgrounds in IE6
             body = _ie6_png(body) or body
+
+        if status == 200 and ctype.startswith('image/'):
+            extra.update(_image_cache_headers(headers, body))
+            # Validate against the representation actually sent to IE6.
+            # Never forward the original SVG's entity tag for converted PNG.
+            requested = self.headers.get('If-None-Match', '')
+            tags = [tag.strip().removeprefix('W/') for tag in requested.split(',')]
+            if '*' in tags or extra['ETag'] in tags:
+                self.send_response(304)
+                for key, value in extra.items():
+                    self.send_header(key, value)
+                self.end_headers()
+                return
 
         self._send(body, ctype, status, head_only, extra)
 

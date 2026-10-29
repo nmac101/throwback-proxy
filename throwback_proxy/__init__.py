@@ -43,13 +43,13 @@ the openssl CLI is optional (enables CONNECT/TLS for system-proxy mode).
 
 Modules:
   config  -- global constants (host, port, user agent, ad domains, ...)
-  urls    -- the proxy URL scheme (to_proxy / from_proxy)
-  css     -- CSS rewriting
+  urls    -- the proxy URL scheme (to_proxy / from_proxy) and ad matching
+  css     -- CSS rewriting (media: @media evaluation, colors: gradients)
   html    -- HTML rewriting
-  layout  -- layout fixes (flex/grid/fixed-pinning/viewport)
+  layout  -- layout fixes (fixed-pinning/viewport/backgrounds)
+  flex    -- flex/grid row approximation
   fetch   -- upstream HTTP fetching
   images  -- webp/svg -> PNG conversion
-  ads     -- ad / tracking domain matching
   server  -- the HTTP proxy server and entry point
 """
 

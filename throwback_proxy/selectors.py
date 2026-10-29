@@ -15,6 +15,10 @@ combinator linking it to the previous one:
 
 import hashlib
 import re
+from html import escape
+from html.parser import HTMLParser
+
+from .markup import TAG_MAP
 
 _ATTR_RE = re.compile(
     r"""\[\s*([\w:-]+)\s*(?:([~|^$*]?=)\s*(?:"([^"]*)"|'([^']*)'|([^\s\]]*))"""
@@ -61,9 +65,11 @@ def _parse_compound(text, masks):
              "attrs": tuple(attrs), "struct": struct, "comb": ""}, pseudo)
 
 
-def rewrite_selector(sel, synth=None):
+def rewrite_selector(sel, synth=None, force_static=False):
     """Replace the selector parts IE6 can't match by synthetic classes.
-    Specs are recorded in *synth* (token -> chain) when given."""
+    Specs are recorded in *synth* (token -> chain) when given. force_static
+    registers complete selector matches for runtime layout targets and
+    rejects dynamic states and pseudo-elements."""
     masks = []
 
     def mask(m):
@@ -71,24 +77,49 @@ def rewrite_selector(sel, synth=None):
         return "\x00%d\x00" % (len(masks) - 1)
 
     work = re.sub(r"\[[^\]]*\]", mask, sel)
-    out = ",".join(_rewrite_one(p, masks, synth) for p in work.split(","))
+    out = ",".join(_rewrite_one(p, masks, synth, force_static) for p in work.split(","))
     return re.sub(r"\x00(\d+)\x00", lambda m: masks[int(m.group(1))], out)
 
 
-def _rewrite_one(sel, masks, synth):
+def split_selectors(text):
+    """Split a selector list without splitting quoted values or :is(...)."""
+    start, depth, quote, escaped = 0, 0, None, False
+    for i, char in enumerate(text):
+        if escaped:
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif quote:
+            if char == quote:
+                quote = None
+        elif char in "\"'":
+            quote = char
+        elif char in "([":
+            depth += 1
+        elif char in ")]":
+            depth -= 1
+        elif char == "," and depth == 0:
+            yield text[start:i]
+            start = i + 1
+    yield text[start:]
+
+
+def _rewrite_one(sel, masks, synth, force_static=False):
     lead = sel[:len(sel) - len(sel.lstrip())]
     trail = sel[len(sel.rstrip()):]
     if lead or trail:
-        return lead + _rewrite_one(sel.strip(), masks, synth) + trail
+        return lead + _rewrite_one(sel.strip(), masks, synth, force_static) + trail
     parts = re.split(r"(\s*[>+~]\s*|\s+)", sel)
     comps = []  # (index in parts, compound, pseudo)
     for i in range(0, len(parts), 2):
         pc = _parse_compound(parts[i], masks)
         if pc is None:
-            return sel
+            return "" if force_static else sel
         comps.append((i, pc[0], pc[1]))
     combs = [p.strip() or " " for p in parts[1::2]]
-    chain_mode = any(c in "+~" for c in combs) or any(
+    if force_static and any(p for _, _, p in comps):
+        return ""  # no runtime sizing for hover/focus or pseudo-elements
+    chain_mode = force_static or any(c in (">", "+", "~") for c in combs) or any(
         c["struct"] for _, c, _ in comps)
     if chain_mode:
         # dynamic pseudos (:hover...) can only ride on the last compound
@@ -105,7 +136,9 @@ def _rewrite_one(sel, masks, synth):
             synth[tok] = chain
         return "." + tok + comps[-1][2]
     for i, c, pseudo in comps:
-        if len(c["classes"]) < 2 and not c["attrs"]:
+        if (len(c["classes"]) < 2 and not c["attrs"]
+                and not (c["id"] and c["classes"])
+                and c["tag"] not in TAG_MAP):
             continue
         chain = [c]
         tok = _token(tuple(sorted(c.items())))
@@ -154,29 +187,43 @@ def _parse_elements(html):
     plus {open-tag offset: index} and the last child of every parent."""
     els, at, last_child = [], {}, {}
     stack = []  # indices of open elements
-    for m in re.finditer(r"<(/?)([a-zA-Z][\w:-]*)\b([^>]*)>", html):
-        closing, tag, rest = m.group(1), m.group(2).lower(), m.group(3)
-        if closing:
+    lines = [0] + [m.end() for m in re.finditer("\n", html)]
+
+    class Parser(HTMLParser):
+        CDATA_CONTENT_ELEMENTS = ("script", "style", "textarea", "title")
+
+        def handle_endtag(self, tag):
             for k in range(len(stack) - 1, -1, -1):
                 if els[stack[k]]["tag"] == tag:
                     del stack[k:]
                     break
-            continue
-        if tag in _AUTO_CLOSE and stack and els[stack[-1]]["tag"] == tag:
-            stack.pop()
-        attrs = {}
-        for am in _TAG_ATTR_RE.finditer(rest):
-            val = next((g for g in am.group(2, 3, 4) if g is not None), "")
-            attrs.setdefault(am.group(1).lower(), val)
-        parent = stack[-1] if stack else -1
-        idx = len(els)
-        els.append({"tag": tag, "attrs": attrs, "parent": parent,
-                    "classes": set(attrs.get("class", "").split()),
-                    "prev": last_child.get(parent, -1)})
-        last_child[parent] = idx
-        at[m.start()] = idx
-        if tag not in _VOID and not rest.rstrip().endswith("/"):
-            stack.append(idx)
+
+        def handle_starttag(self, tag, attributes):
+            if tag in _AUTO_CLOSE and stack and els[stack[-1]]["tag"] == tag:
+                stack.pop()
+            attrs = {}
+            for name, value in attributes:
+                attrs.setdefault(name, value or "")
+            line, column = self.getpos()
+            start = lines[line - 1] + column
+            parent = stack[-1] if stack else -1
+            idx = len(els)
+            els.append({"tag": tag, "attrs": attrs, "parent": parent,
+                        "classes": set(attrs.get("class", "").split()),
+                        "prev": last_child.get(parent, -1),
+                        "end": start + len(self.get_starttag_text())})
+            last_child[parent] = idx
+            at[start] = idx
+            if tag not in _VOID:
+                stack.append(idx)
+
+        def handle_startendtag(self, tag, attrs):
+            self.handle_starttag(tag, attrs)
+            self.handle_endtag(tag)
+
+    parser = Parser(convert_charrefs=True)
+    parser.feed(html)
+    parser.close()
     return els, at, last_child
 
 
@@ -238,17 +285,20 @@ def apply_synthetic_classes(html, synth):
         if toks:
             add[start] = " ".join(toks)
 
-    def sub(m):
-        extra = add.get(m.start())
-        if not extra:
-            return m.group(0)
-        tag, rest = m.group(1), m.group(2)
-        cm = re.search(r'\bclass\s*=\s*(["\'])(.*?)\1', rest, re.I)
+    for start, extra in sorted(add.items(), reverse=True):
+        el = els[at[start]]
+        end = el["end"]
+        original = html[start:end]
+        tag_end = re.match(r"<[\w:-]+", original).end()
+        rest = original[tag_end:]
+        cm = next((m for m in _TAG_ATTR_RE.finditer(rest)
+                   if m.group(1).lower() == "class"), None)
+        value = escape((el["attrs"].get("class", "") + " " + extra).strip(),
+                       quote=True)
+        attr = 'class="%s"' % value
         if cm:
-            rest = (rest[:cm.start()] + 'class=%s%s %s%s' % (
-                cm.group(1), cm.group(2), extra, cm.group(1))
-                + rest[cm.end():])
-            return "<%s%s>" % (tag, rest)
-        return '<%s class="%s"%s>' % (tag, extra, rest)
-
-    return re.sub(r"<([a-zA-Z][\w:-]*)\b([^>]*)>", sub, html)
+            rest = rest[:cm.start()] + attr + rest[cm.end():]
+        else:
+            rest = " " + attr + rest
+        html = html[:start] + original[:tag_end] + rest + html[end:]
+    return html

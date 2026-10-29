@@ -50,12 +50,9 @@ def _get_once(url, timeout, deadline):
     try:
         resp = _opener.open(req, timeout=timeout)
     except HTTPError as e:
-        # Normalise header keys to title case (see below).
-        try:
-            body = e.read()
-        except Exception:
-            body = b""
-        return e.code, {k.title(): v for k, v in (e.headers.items() or [])}, body
+        # Error/redirect bodies need the same deadline and close handling
+        # as successful responses; e.read() could otherwise block forever.
+        resp = e
     except Exception:
         return None, None, None
     # Normalise header keys to title case: some servers (Wikipedia) send
@@ -64,8 +61,13 @@ def _get_once(url, timeout, deadline):
     chunks = []
     try:
         while True:
-            if time.monotonic() > deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 return None, None, None
+            sock = getattr(getattr(getattr(resp, "fp", None), "raw", None),
+                           "_sock", None)
+            if sock is not None:
+                sock.settimeout(min(timeout, remaining))
             # read1() returns as soon as *some* bytes are available (up to
             # 65536), so the deadline check above runs often.  A plain
             # read(65536) would block until the full buffer is filled and the
@@ -99,7 +101,10 @@ def http_get(url, timeout=10):
     """
     deadline = time.monotonic() + timeout
     for _ in range(MAX_REDIRECTS):
-        status, headers, body = _get_once(url, timeout, deadline)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None, None, None
+        status, headers, body = _get_once(url, remaining, deadline)
         loc = headers.get("Location") if headers else None
         if status in (301, 302, 303, 307, 308) and loc:
             nxt = urljoin(url, loc)

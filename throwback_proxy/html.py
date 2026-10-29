@@ -2,52 +2,30 @@
 ad/module script removal, and URL rewriting through the proxy."""
 
 import re
+from html import escape, unescape
+from html.parser import HTMLParser
 from urllib.parse import urljoin, urlparse
 
 from .config import XHTML_STRICT_DOCTYPE
 from .config import FIX_IE_CSS_LIMIT_PATH
-from .css import _rewrite_css_urls, _transform_decls
+from .css import _media_query_true, _rewrite_css_urls, _transform_decls
+from .markup import TAG_MAP, protect_raw_text
+from .metrics import BOX_METRICS_JS, VIEWPORT_SCROLL_JS
 from .urls import to_proxy
-
-TAG_MAP = {
-    "section": "div",
-    "article": "div",
-    "nav": "div",
-    "header": "div",
-    "footer": "div",
-    "main": "div",
-    "aside": "div",
-    "figure": "div",
-    "figcaption": "div",
-    "details": "div",
-    "time": "span",
-    "bdi": "span",
-    "bdo": "span",
-    "output": "span",
-    "mark": "span",
-    "summary": "span",
-    "progress": "span",
-    "meter": "span",
-    "dialog": "div",
-    "ruby": "span",
-    "rt": "span",
-    "rp": "span",
-    "rtc": "span",
-    "datalist": "span",
-    "hgroup": "div",
-    "search": "div",
-    "data": "span",
-}
 
 ATTR_RE = re.compile(
     r"""([\w:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))"""
 )
 
 # Tiny ES5 shims so common modern inline scripts at least parse and degrade
-# gracefully in IE6 (which lacks console, querySelector, Audio, addEventListener,
+# gracefully in IE6 (which lacks console, Audio, addEventListener,
 # Array.prototype.forEach, ...). Injected right after <head>.
 IE6_SHIM = (
     "<script>"
+    # IE6 otherwise re-requests CSS backgrounds during repaint/hover. Run
+    # before linked stylesheets; unsupported IE builds must fail harmlessly.
+    "try{document.execCommand('BackgroundImageCache',false,true);}catch(ie6CacheError){}"
+    + BOX_METRICS_JS + VIEWPORT_SCROLL_JS +
     "if(!window.console){window.console={log:function(){},warn:function(){},"
     "error:function(){},info:function(){},debug:function(){}};}"
     "if(!Array.prototype.indexOf){Array.prototype.indexOf=function(x,i){for(i="
@@ -67,8 +45,6 @@ IE6_SHIM = (
     "f.apply(t,a.concat(Array.prototype.slice.call(arguments)));};};}"
     "if(!Array.prototype.forEach){Array.prototype.forEach=function(f){for("
     "var i=0;i<this.length;i++){f(this[i],i,this);}};}"
-    "if(!document.querySelector){document.querySelector=function(){return null;};}"
-    "if(!document.querySelectorAll){document.querySelectorAll=function(){return[];};}"
     "if(!window.Audio){window.Audio=function(){return{play:function(){},pause:"
     "function(){},currentTime:0};};}"
     "if(!document.addEventListener){document.addEventListener=function(t,f){var "
@@ -82,29 +58,88 @@ IE6_SHIM = (
 
 
 def _downgrade_js(src):
-    """Light ES6->ES5 pass for inline scripts: const/let -> var and block-body
-    arrow functions -> function expressions. Deeper syntax (template literals,
-    class, async) is left alone; if it remains the script simply fails in IE6."""
-    s = re.sub(r"\b(const|let)\s+", "var ", src)
-    # block-body arrows: "(a, b) => {" -> "function(a, b){"
-    s = re.sub(r"(\([^()]*\))\s*=>\s*\{", r"function\1{", s)
-    # bare-identifier arrows: "x => {" -> "function(x){"
-    s = re.sub(r"([A-Za-z_$][\w$]*)\s*=>\s*\{", r"function(\1){", s)
-    return s
+    """Best-effort const/let -> var pass, preserving literals and comments.
+
+    This is not a transpiler; unsupported syntax remains unsupported.
+    """
+    # Preserve literal/comment text. Arrow functions need lexical this and
+    # arguments semantics, which a regex substitution cannot preserve.
+    tokens = re.compile(
+        r'''("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|'''
+        r'''/\*.*?\*/|//[^\r\n]*|/(?![/*])(?:\\.|\[(?:\\.|[^\]\\])*\]|[^/\r\n\\])+/[a-z]*)''',
+        re.S)
+    parts = tokens.split(src)
+    for i in range(0, len(parts), 2):
+        parts[i] = re.sub(r"\b(?:const|let)\s+(?=[A-Za-z_$])", "var ", parts[i])
+    return "".join(parts)
 
 SKIP_URL_PREFIXES = ("data:", "#", "javascript:", "mailto:", "tel:", "about:")
+
+
+def document_styles(html, base):
+    """Return the document base and stylesheet sources in DOM order.
+
+    HTMLParser keeps comments, script strings and quoted '>' characters
+    from being mistaken for stylesheet elements. Attributes are decoded
+    once here, including unquoted hrefs and entity-escaped query strings.
+    """
+    class Sources(HTMLParser):
+        CDATA_CONTENT_ELEMENTS = ("script", "style", "textarea", "title")
+
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.base = None
+            self.sources = []
+            self.style = None
+            self.template_depth = 0
+
+        def handle_starttag(self, tag, pairs):
+            attrs = dict(pairs)
+            if tag == "template":
+                self.template_depth += 1
+            if self.template_depth:
+                return
+            if tag == "base" and self.base is None and "href" in attrs:
+                self.base = urljoin(base, attrs["href"] or "")
+            if "disabled" in attrs or not _media_query_true(attrs.get("media") or ""):
+                return
+            if (attrs.get("type") or "text/css").lower() != "text/css":
+                return
+            if tag == "style":
+                self.style = ["inline", ""]
+                self.sources.append(self.style)
+            if tag == "link":
+                rel = (attrs.get("rel") or "").lower().split()
+                if "stylesheet" in rel and "alternate" not in rel and attrs.get("href"):
+                    self.sources.append(["external", attrs["href"]])
+
+        def handle_endtag(self, tag):
+            if tag == "style":
+                self.style = None
+            if tag == "template":
+                self.template_depth = max(0, self.template_depth - 1)
+
+        def handle_data(self, data):
+            if self.style is not None:
+                self.style[1] += data
+
+    parser = Sources()
+    parser.feed(html)
+    parser.close()
+    return parser.base or base, parser.sources
 
 
 def _rewrite_attrs(tag, base, abs_base=None):
     def sub(a):
         name = a.group(1).lower()
-        val = next(g for g in a.groups()[1:] if g is not None)
+        val = unescape(next(g for g in a.groups()[1:] if g is not None))
         if name == "srcset":
             return ""
         if name == "style":
-            return 'style="%s"' % _rewrite_css_urls(
-                _transform_decls(val), base, abs_base
-            ).replace('"', "'")
+            return 'style="%s"' % escape(_rewrite_css_urls(
+                _transform_decls(val), base, abs_base), quote=True)
+        if name == "media" and re.match(r"<(?:link|style)\b", tag, re.I):
+            return 'media="%s"' % ("screen" if _media_query_true(val) else "print")
         # src/href/poster are the usual URL attributes; resource and
         # content are MediaWiki's lazy-load URL attributes (IE6 never runs
         # the lazy-load JS, but the URLs should still be http).
@@ -118,10 +153,10 @@ def _rewrite_attrs(tag, base, abs_base=None):
             if name in ("resource", "content") \
                     and not re.match(r"(?:https?:)?//", v, re.I):
                 return a.group(0)
-            absu = urljoin(base, v)
+            absu = base if name == "href" and re.match(r"<base\b", tag, re.I) else urljoin(base, v)
             if urlparse(absu).scheme in ("http", "https"):
                 v = to_proxy(absu, abs_base)
-            return '%s="%s"' % (a.group(1), v)
+            return '%s="%s"' % (a.group(1), escape(v, quote=True))
         return a.group(0)
 
     return ATTR_RE.sub(sub, tag)
@@ -129,9 +164,7 @@ def _rewrite_attrs(tag, base, abs_base=None):
 
 def transform_html(html, base, abs_base=None):
     # <base href> changes how relative URLs resolve -- honour it first.
-    bm = re.search(r"<base[^>]+href\s*=\s*['\"]([^'\"]+)['\"]", html, re.I)
-    if bm:
-        base = urljoin(base, bm.group(1))
+    base, _ = document_styles(html, base)
 
     # Drop ES modules and ad scripts; strip defer/async from the rest;
     # down-grade inline script syntax to ES5.
@@ -174,6 +207,8 @@ def transform_html(html, base, abs_base=None):
         return re.sub(r"\s(?:defer|async)(?:\s*=\s*[^>\s]*)?", "", m.group(0))
 
     html = re.sub(r"<script\b[^>]*>", _clean_script_open, html, flags=re.I)
+
+    html, restore_raw = protect_raw_text(html)
 
     # <picture>: keep the fallback <img>, drop <source>s.
     html = re.sub(r"<picture(\s[^>]*)?>", r"<div\1>", html, flags=re.I)
@@ -277,4 +312,4 @@ def transform_html(html, base, abs_base=None):
             r"</head\s*>", lambda m: script + m.group(0),
             html, count=1, flags=re.I,
         )
-    return html
+    return restore_raw(html)

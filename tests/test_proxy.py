@@ -1,12 +1,15 @@
 """Regression tests: python3 -m unittest discover -s tests"""
 
 import threading
+import base64
 import unittest
-import urllib.request
+from unittest.mock import patch
+from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from throwback_proxy.css import _eval_calc, _replace_calc, transform_css
 from throwback_proxy.html import transform_html
+from throwback_proxy.images import _ie6_png
 from throwback_proxy.layout import _flex_container_classes, _flex_row_layout
 from throwback_proxy.selectors import apply_synthetic_classes
 from throwback_proxy.server import Handler, _decode, _Server
@@ -79,6 +82,7 @@ class WikiRegressionTests(unittest.TestCase):
         self.assertIn("font-size: 0", out)
 
 
+@unittest.skipIf(_ie6_png is None, "optional Pillow dependency is unavailable")
 class PngAlphaTests(unittest.TestCase):
     def _png(self, img):
         import io
@@ -164,6 +168,45 @@ class ArchWikiRegressionTests(unittest.TestCase):
         self.assertIn("overflow:hidden;zoom:1", out)
 
 
+class ArchWikiRound2Tests(unittest.TestCase):
+    def test_universal_child_selector_is_exact(self):
+        syn = {}
+        css = transform_css(".cols > *{display:inline-block;width:100%}",
+                            "http://x/", synth=syn)
+        self.assertIn("display: block", css)  # full-width inline-block
+        html = apply_synthetic_classes(
+            '<div class="cols"><dl><dt>a</dt></dl></div>', syn)
+        self.assertIn('<dl class="ie6x', html)
+        self.assertNotIn('<dt class', html)  # grandchildren untouched
+
+    def test_negative_margin_gets_position_relative(self):
+        out = transform_css("#nav{margin-left:-8px}", "http://x/")
+        self.assertIn("position: relative", out)
+
+    def test_max_width_container_capped(self):
+        from throwback_proxy.layout import (_apply_max_widths,
+                                            _max_width_classes)
+        mw = _max_width_classes(".box{max-width:31.25rem} .big{max-width:900px}")
+        self.assertEqual(mw, {"box": 500})
+        out = _apply_max_widths('<div class="box">x</div><b class="box">y</b>',
+                                mw)
+        self.assertIn('<div class="box" style="width:500px;">', out)
+        self.assertIn('<b class="box">', out)
+
+    def test_grid_sibling_beside_float_is_bfc(self):
+        from throwback_proxy.layout import (_grid_column_classes,
+                                            _grid_row_layout)
+        gc, ga = _grid_column_classes(
+            ".g{display:grid;grid-template-columns:200px 1fr;"
+            "grid-template-areas:'side main'} .s{grid-area:side}"
+            " .g{grid-template-columns:300px 1fr}")
+        self.assertEqual(gc["g"]["width"], 300)  # later rule wins
+        out = _grid_row_layout(
+            '<div class="g"><div class="s">a</div><div>b</div></div>', gc, ga)
+        self.assertIn("float:left;width:300px", out)
+        self.assertIn("overflow:hidden;zoom:1", out)
+
+
 class HtmlTests(unittest.TestCase):
     def test_doctype_first_and_prolog_removed(self):
         out = transform_html('﻿<?xml version="1.0"?>\n<!-- c -->'
@@ -224,6 +267,36 @@ class _Upstream(BaseHTTPRequestHandler):
         elif self.path == "/xhtml":
             body, ctype = b"<html><head></head><body>x</body></html>", \
                 "application/xhtml+xml"
+        elif self.path == "/audit":
+            body = (b'<html><head><base href="/assets/">'
+                    b'<link rel=stylesheet href=main.css>'
+                    b'<style media=print>.row{display:flex}</style>'
+                    b'<style>.row{display:block}.box > p{color:red}</style>'
+                    b'</head><body><div class="row"><div>a</div><div>b</div></div>'
+                    b'<div class="box"><p>direct</p><div><p>nested</p></div></div>'
+                    b'<script>var s="<section><style>.fake{color:red}</style></section>";'
+                    b'</script></body></html>')
+            ctype = 'Text/HTML; charset="utf-8"'
+        elif self.path == "/assets/main.css":
+            body, ctype = b'.row{display:flex}', 'text/css'
+        elif self.path == "/sizing":
+            body = (b'<html><head><style>.tabs a{box-sizing:border-box;'
+                    b'height:3em;padding-top:1em}</style></head>'
+                    b'<body><div class="tabs"><a href="/latin">Tab</a></div>'
+                    b'<a href="/latin">Other link</a></body></html>')
+            ctype = 'text/html'
+        elif self.path == "/search.svg?a45d6":
+            body = (b'<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20">'
+                    b'<rect width="10" height="10"/></svg>')
+            # Some origins mislabel SVG; the path check must ignore queries.
+            ctype = 'application/octet-stream'
+        elif self.path == "/mediawiki":
+            body = (b'<html><head><meta name="generator" content="MediaWiki 1.46">'
+                    b'<style>.toc{display:table}.mw-jump-link:not(:focus){position:absolute}</style>'
+                    b'</head><body><a class="mw-jump-link" href="#toc">Jump</a>'
+                    b'<div id="toc" class="toc"><div>Contents</div><ul><li>Section</li></ul>'
+                    b'</div><h2>Section</h2></body></html>')
+            ctype = 'text/html'
         elif self.path == "/redir":
             self.send_response(301)
             self.send_header("Location", "/final")
@@ -240,6 +313,9 @@ class _Upstream(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        if self.path == "/search.svg?a45d6":
+            self.send_header('Last-Modified', 'Tue, 30 Jun 2026 12:29:04 GMT')
+            self.send_header('ETag', '"upstream-svg"')
         self.end_headers()
         self.wfile.write(body)
 
@@ -253,23 +329,24 @@ class EndToEndTests(unittest.TestCase):
         cls.proxy.daemon_threads = True
         for srv in (cls.up, cls.proxy):
             threading.Thread(target=srv.serve_forever, daemon=True).start()
-        cls.opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler(
-                {"http": "http://127.0.0.1:%d" % cls.proxy.server_address[1]}),
-            _NoRedirect())
 
     @classmethod
     def tearDownClass(cls):
         cls.up.shutdown()
         cls.proxy.shutdown()
+        cls.up.server_close()
+        cls.proxy.server_close()
 
-    def get(self, path):
+    def get(self, path, method="GET", body=None, headers=None):
         url = "http://127.0.0.1:%d%s" % (self.up.server_address[1], path)
+        # Connect explicitly so HTTP_PROXY/NO_PROXY cannot bypass the proxy.
+        connection = HTTPConnection(*self.proxy.server_address, timeout=10)
         try:
-            r = self.opener.open(url, timeout=10)
-        except urllib.error.HTTPError as e:
-            r = e
-        return r.status, r.headers, r.read()
+            connection.request(method, url, body=body, headers=headers or {})
+            with connection.getresponse() as r:
+                return r.status, r.headers, r.read()
+        finally:
+            connection.close()
 
     def test_latin1_page_decoded(self):
         status, headers, body = self.get("/latin")
@@ -288,10 +365,75 @@ class EndToEndTests(unittest.TestCase):
     def test_upstream_status_preserved(self):
         self.assertEqual(self.get("/missing")[0], 404)
 
+    def test_styles_selectors_and_script_text_through_proxy(self):
+        status, headers, body = self.get('/audit')
+        self.assertEqual(status, 200)
+        out = body.decode('utf-8')
+        self.assertIn('<div class="row"><div>a</div><div>b</div></div>', out)
+        self.assertIn('<p class="ie6x', out)
+        self.assertIn('<p>nested</p>', out)
+        self.assertIn('<style media="print">', out)
+        self.assertIn('"<section><style>.fake{color:red}</style></section>"', out)
+        self.assertNotIn('\x00', out)
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *a, **k):
-        return None
+    def test_head_matches_get_headers_without_body(self):
+        _, get_headers, _ = self.get('/latin')
+        status, headers, body = self.get('/latin', method='HEAD')
+        self.assertEqual(status, 200)
+        self.assertEqual(headers['Content-Length'], get_headers['Content-Length'])
+        self.assertEqual(body, b'')
+
+    def test_box_sizing_uses_scoped_event_pass_without_expressions(self):
+        status, _, body = self.get('/sizing')
+        self.assertEqual(status, 200)
+        html = body.decode('utf-8')
+        self.assertNotIn('expression(', html)
+        self.assertIn('window.__tbInitSizing([', html)
+        self.assertIn('<a class="ie6x', html)
+        self.assertNotIn('class="ie6x', html[html.index('Tab</a>'):html.index('Other link')])
+
+    def test_mediawiki_components_through_proxy(self):
+        status, _, body = self.get('/mediawiki')
+        self.assertEqual(status, 200)
+        html = body.decode('utf-8')
+        self.assertIn('float:left;width:auto;display:block;', html)
+        self.assertIn('class="mw-jump-link tb-ie6-skip-hidden"', html)
+        self.assertIn('href="#toc"', html)
+        self.assertIn("attachEvent('onfocus',show)", html)
+        self.assertIn('clear:left', html)
+        self.assertNotIn('\x00', html)
+
+    @patch('throwback_proxy.server._svg_to_png')
+    def test_versioned_svg_is_a_cacheable_png_with_downstream_validator(self, convert):
+        convert.return_value = base64.b64decode(
+            'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8'
+            'AAQUBAScY42YAAAAASUVORK5CYII=')
+        status, headers, data = self.get('/search.svg?a45d6')
+        self.assertEqual(status, 200)
+        self.assertEqual(headers['Content-Type'], 'image/png')
+        self.assertTrue(data.startswith(b'\x89PNG\r\n\x1a\n'))
+        self.assertEqual(headers['Content-Length'], str(len(data)))
+        self.assertEqual(headers['Cache-Control'], 'private, max-age=60')
+        self.assertEqual(headers['Last-Modified'], 'Tue, 30 Jun 2026 12:29:04 GMT')
+        self.assertNotEqual(headers['ETag'], '"upstream-svg"')
+        self.assertTrue(convert.call_args.args[0].startswith(b'<svg'))
+        self.assertIsNone(convert.call_args.args[1])
+        status, again, empty = self.get('/search.svg?a45d6',
+                                      headers={'If-None-Match': 'W/' + headers['ETag']})
+        self.assertEqual(status, 304)
+        self.assertEqual(empty, b'')
+        self.assertEqual(again['ETag'], headers['ETag'])
+        self.assertNotIn('Content-Length', again)
+        status, head, empty = self.get('/search.svg?a45d6', method='HEAD')
+        self.assertEqual(head['Content-Length'], str(len(data)))
+        self.assertEqual(head['ETag'], headers['ETag'])
+        self.assertEqual(empty, b'')
+
+    def test_post_closes_connection_with_unread_body(self):
+        status, headers, body = self.get('/latin', method='POST', body=b'data')
+        self.assertEqual(status, 405)
+        self.assertEqual(headers['Connection'], 'close')
+        self.assertEqual(headers['Allow'], 'GET, HEAD')
 
 
 if __name__ == "__main__":

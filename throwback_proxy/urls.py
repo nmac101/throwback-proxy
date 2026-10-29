@@ -1,8 +1,11 @@
 """Proxy URL scheme:  /<scheme>/<host[:port]>/<path>?<query>
-(the legacy "/p/<scheme>/..." prefix is also accepted)."""
+(the legacy "/p/<scheme>/..." prefix is also accepted), plus ad / tracking
+domain matching."""
 
 import re
-from urllib.parse import unquote, urlparse
+from urllib.parse import urlparse
+
+from .config import AD_DOMAINS
 
 def to_proxy(url, abs_base=None):
     p = urlparse(url)
@@ -20,7 +23,8 @@ def to_proxy(url, abs_base=None):
         return p.geturl()
     path = p.path or "/"
     query = ("?" + p.query) if p.query else ""
-    return "/%s/%s%s%s" % (p.scheme, p.netloc, path, query)
+    fragment = ("#" + p.fragment) if p.fragment else ""
+    return "/%s/%s%s%s%s" % (p.scheme, p.netloc, path, query, fragment)
 
 
 def from_proxy(path):
@@ -32,9 +36,14 @@ def from_proxy(path):
         pth, query = rest.split("?", 1)
     else:
         pth, query = rest, ""
-    url = "%s://%s%s" % (scheme, host, unquote(pth))
+    # These paths are already URL-encoded. Unquoting turns %2F/%3F/%23
+    # into URL delimiters and changes which upstream resource is requested.
+    url = "%s://%s%s" % (scheme, host, pth)
     if query:
         url += "?" + query
     return url
 
 
+def _is_ad_url(url):
+    host = urlparse(url).netloc.lower().split(":")[0]
+    return any(host == d or host.endswith("." + d) for d in AD_DOMAINS)

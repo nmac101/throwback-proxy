@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "throwback-proxy"
+version = "1.0"
+description = "HTTP proxy that rewrites modern web pages for Internet Explorer 6"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.optional-dependencies]
+images = ["Pillow"]
+
+[project.scripts]
+throwback-proxy = "throwback_proxy.server:main"
+
+[tool.setuptools]
+packages = ["throwback_proxy"]
